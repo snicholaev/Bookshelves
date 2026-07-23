@@ -202,27 +202,94 @@ function AuthScreen({ onAuth }) {
 // ── Barcode Scanner Modal ─────────────────────────────────────────────────────
 function ScannerModal({ onResult, onClose }) {
   const videoRef = useRef();
+  const canvasRef = useRef();
+  const streamRef = useRef();
+  const rafRef = useRef();
   const readerRef = useRef();
   const [err, setErr] = useState("");
-  const [scanning, setScanning] = useState(true);
+  const [found, setFound] = useState(false);
+  const [showManual, setShowManual] = useState(false);
+  const [manualIsbn, setManualIsbn] = useState("");
 
   useEffect(() => {
+    // Set up ZXing reader with all relevant formats + extra hints
     const hints = new Map();
-    const formats = [ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.EAN_8, ZXing.BarcodeFormat.UPC_A];
-    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
-    const reader = new ZXing.BrowserMultiFormatReader(hints);
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+      ZXing.BarcodeFormat.EAN_13,
+      ZXing.BarcodeFormat.EAN_8,
+      ZXing.BarcodeFormat.UPC_A,
+      ZXing.BarcodeFormat.UPC_E,
+      ZXing.BarcodeFormat.CODE_128,
+    ]);
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    const reader = new ZXing.MultiFormatReader();
+    reader.setHints(hints);
     readerRef.current = reader;
 
-    reader.decodeFromVideoDevice(null, videoRef.current, (result, err) => {
-      if (result) {
-        setScanning(false);
-        reader.reset();
-        onResult(result.getText());
-      }
-    }).catch(e => setErr("Camera access denied. Please allow camera use."));
+    // Start camera — prefer rear camera, high resolution
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    }).then(stream => {
+      streamRef.current = stream;
+      videoRef.current.srcObject = stream;
+      videoRef.current.play();
+      videoRef.current.onloadedmetadata = () => tick();
+    }).catch(() => setErr("Camera access denied. Please allow camera use or enter the ISBN manually."));
 
-    return () => { try { reader.reset(); } catch {} };
+    return () => {
+      cancelAnimationFrame(rafRef.current);
+      streamRef.current?.getTracks().forEach(t => t.stop());
+    };
   }, []);
+
+  function tick() {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || video.readyState < 2) { rafRef.current = requestAnimationFrame(tick); return; }
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0);
+
+    // Try decoding full frame
+    tryDecode(ctx, canvas.width, canvas.height);
+
+    rafRef.current = requestAnimationFrame(tick);
+  }
+
+  function tryDecode(ctx, w, h) {
+    // Try multiple crops: full frame, center strip, center crop
+    const crops = [
+      [0, 0, w, h],
+      [0, Math.floor(h * 0.3), w, Math.floor(h * 0.4)],
+      [Math.floor(w * 0.1), Math.floor(h * 0.25), Math.floor(w * 0.8), Math.floor(h * 0.5)],
+    ];
+    for (const [x, y, cw, ch] of crops) {
+      try {
+        const imageData = ctx.getImageData(x, y, cw, ch);
+        const luminance = new ZXing.RGBLuminanceSource(imageData.data, cw, ch);
+        const binary = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+        const result = readerRef.current.decode(binary);
+        if (result) {
+          cancelAnimationFrame(rafRef.current);
+          streamRef.current?.getTracks().forEach(t => t.stop());
+          setFound(true);
+          setTimeout(() => onResult(result.getText()), 300);
+          return;
+        }
+      } catch {}
+    }
+  }
+
+  function submitManual() {
+    const isbn = manualIsbn.replace(/[^0-9X]/gi, "");
+    if (isbn.length === 10 || isbn.length === 13) {
+      onResult(isbn);
+    } else {
+      setErr("Please enter a valid 10 or 13 digit ISBN.");
+    }
+  }
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "#000", zIndex: 200, display: "flex", flexDirection: "column" }}>
@@ -230,24 +297,58 @@ function ScannerModal({ onResult, onClose }) {
         <div style={{ color: "#fff", fontSize: 16, fontWeight: 600 }}>Scan barcode</div>
         <button onClick={onClose} style={{ background: "none", border: "none", color: "#fff", fontSize: 28, cursor: "pointer", lineHeight: 1 }}>×</button>
       </div>
+
       <div style={{ flex: 1, position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
-        <video ref={videoRef} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-        {/* Viewfinder overlay */}
+        <video ref={videoRef} playsInline muted style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        <canvas ref={canvasRef} style={{ display: "none" }} />
+
+        {/* Viewfinder */}
         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
-          <div style={{ width: 260, height: 120, border: "2px solid #4A7C59", borderRadius: 8, boxShadow: "0 0 0 2000px #00000055" }}>
-            <div style={{ position: "absolute", top: -1, left: -1, width: 20, height: 20, borderTop: "3px solid #4AFF80", borderLeft: "3px solid #4AFF80", borderRadius: "4px 0 0 0" }} />
-            <div style={{ position: "absolute", top: -1, right: -1, width: 20, height: 20, borderTop: "3px solid #4AFF80", borderRight: "3px solid #4AFF80", borderRadius: "0 4px 0 0" }} />
-            <div style={{ position: "absolute", bottom: -1, left: -1, width: 20, height: 20, borderBottom: "3px solid #4AFF80", borderLeft: "3px solid #4AFF80", borderRadius: "0 0 0 4px" }} />
-            <div style={{ position: "absolute", bottom: -1, right: -1, width: 20, height: 20, borderBottom: "3px solid #4AFF80", borderRight: "3px solid #4AFF80", borderRadius: "0 0 4px 0" }} />
+          <div style={{ width: 280, height: 130, position: "relative", boxShadow: "0 0 0 2000px #00000066" }}>
+            {/* Animated scan line */}
+            {!found && <div style={{ position: "absolute", top: "50%", left: 0, right: 0, height: 2, background: "linear-gradient(90deg, transparent, #4AFF80, transparent)", animation: "scanline 1.5s ease-in-out infinite" }} />}
+            {[["top:-2px","left:-2px","borderTop","borderLeft"],["top:-2px","right:-2px","borderTop","borderRight"],["bottom:-2px","left:-2px","borderBottom","borderLeft"],["bottom:-2px","right:-2px","borderBottom","borderRight"]].map(([t, lr, b1, b2], i) => (
+              <div key={i} style={{ position: "absolute", width: 24, height: 24, [t.split(":")[0]]: t.split(":")[1], [lr.split(":")[0]]: lr.split(":")[1], [b1]: "3px solid #4AFF80", [b2]: "3px solid #4AFF80" }} />
+            ))}
           </div>
         </div>
-        {!scanning && <div style={{ position: "absolute", inset: 0, background: "#00000088", display: "flex", alignItems: "center", justifyContent: "center" }}><Spinner size={36} /></div>}
+
+        {found && (
+          <div style={{ position: "absolute", inset: 0, background: "#00000088", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12 }}>
+            <div style={{ fontSize: 40 }}>✅</div>
+            <div style={{ color: "#fff", fontSize: 15, fontWeight: 600 }}>Barcode detected!</div>
+          </div>
+        )}
       </div>
-      <div style={{ padding: 20, textAlign: "center" }}>
-        {err
-          ? <div style={{ color: "#F87171", fontSize: 14 }}>{err}</div>
-          : <div style={{ color: "#9B927E", fontSize: 13 }}>Point camera at the barcode on the back of a book</div>}
+
+      <div style={{ padding: "16px 20px", background: "#111" }}>
+        {err && <div style={{ color: "#F87171", fontSize: 13, marginBottom: 12, textAlign: "center" }}>{err}</div>}
+
+        {!showManual ? (
+          <div style={{ textAlign: "center" }}>
+            <div style={{ color: "#9B927E", fontSize: 13, marginBottom: 10 }}>Hold the back cover barcode steady inside the frame</div>
+            <button onClick={() => setShowManual(true)} style={{ background: "none", border: "none", color: "#4AFF80", fontSize: 13, cursor: "pointer", textDecoration: "underline" }}>
+              Enter ISBN manually instead
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={manualIsbn}
+              onChange={e => setManualIsbn(e.target.value)}
+              placeholder="Enter ISBN (10 or 13 digits)"
+              style={{ flex: 1, border: "1px solid #333", borderRadius: 8, padding: "10px 12px", fontSize: 14, color: "#fff", background: "#222", outline: "none" }}
+              onKeyDown={e => e.key === "Enter" && submitManual()}
+              autoFocus
+            />
+            <button onClick={submitManual} style={{ background: "#4A7C59", color: "#fff", border: "none", borderRadius: 8, padding: "10px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+              Look up
+            </button>
+          </div>
+        )}
       </div>
+
+      <style>{`@keyframes scanline { 0%,100% { top: 20%; } 50% { top: 80%; } }`}</style>
     </div>
   );
 }

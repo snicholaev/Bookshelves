@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="My Library" />
+  <meta name="theme-color" content="#2C3E2D" />
+  <title>My Library</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.19.1/umd/index.min.js"></script>
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; margin: 0; padding: 0; }
+    body { background: #F7F3EC; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+    .fade-in { animation: fadeIn 0.2s ease; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useCallback, useEffect } = React;
+
+// ── Supabase ──────────────────────────────────────────────────────────────────
+const SUPABASE_URL = "https://memoprwwpgnvqamoreql.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1lbW9wcnd3cGdudnFhbW9yZXFsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMwODU5NjQsImV4cCI6MjA5ODY2MTk2NH0.pOH5wgG0SPRResR0wxcirrZYCcNEEFsCdrWukEkAtbA";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const STATUS_CONFIG = {
+  unread:  { label: "Unread",     color: "#8B7355", bg: "#F5F0E8" },
+  reading: { label: "Reading",    color: "#2C6E49", bg: "#E8F4EE" },
+  read:    { label: "Read",       color: "#1A4A7A", bg: "#E8F0F8" },
+  loaned:  { label: "Loaned out", color: "#8B3A3A", bg: "#F8EAEA" },
+};
+const EMPTY_BOOK = { id: null, title: "", author: "", year: "", genre: "", status: "unread", loanedTo: "", notes: "", cover: null };
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function compressImage(dataUrl) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const MAX_W = 120, MAX_H = 180;
+      let { width: w, height: h } = img;
+      const ratio = Math.min(MAX_W / w, MAX_H / h, 1);
+      w = Math.round(w * ratio); h = Math.round(h * ratio);
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL("image/jpeg", 0.75));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+async function lookupISBN(isbn) {
+  try {
+    const res = await fetch(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`);
+    const data = await res.json();
+    const book = data[`ISBN:${isbn}`];
+    if (!book) return null;
+    return {
+      title: book.title || "",
+      author: book.authors?.[0]?.name || "",
+      year: book.publish_date ? book.publish_date.match(/\d{4}/)?.[0] || "" : "",
+      genre: book.subjects?.[0]?.name || "",
+      cover: book.cover?.medium || null,
+    };
+  } catch { return null; }
+}
+
+async function identifyWithClaude(base64, mimeType, apiKey) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6", max_tokens: 1000,
+      messages: [{ role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: mimeType, data: base64 } },
+        { type: "text", text: `Identify any books visible in this image. For each extract title, author, year, genre.\nRespond ONLY with a JSON array, no markdown:\n[{"title":"...","author":"...","year":"...","genre":"..."}]\nIf no books found, return [].` }
+      ]}]
+    }),
+  });
+  if (res.status === 401) throw new Error("invalid_key");
+  const data = await res.json();
+  const text = data.content?.map(c => c.text || "").join("") || "";
+  try { return JSON.parse(text.replace(/```json|```/g, "").trim()); } catch { return []; }
+}
+
+// ── UI Atoms ──────────────────────────────────────────────────────────────────
+function Spinner({ size = 16, color = "#fff" }) {
+  return <span style={{ display: "inline-block", width: size, height: size, border: `2px solid ${color}44`, borderTopColor: color, borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />;
+}
+
+function StatusBadge({ status }) {
+  const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.unread;
+  return <span style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.color}33`, borderRadius: 4, fontSize: 11, fontWeight: 600, letterSpacing: "0.04em", padding: "2px 8px", textTransform: "uppercase", whiteSpace: "nowrap" }}>{cfg.label}</span>;
+}
+
+// ── Auth Screen ───────────────────────────────────────────────────────────────
+function AuthScreen({ onAuth }) {
+  const [mode, setMode] = useState("login"); // login | magic
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+
+  const inputStyle = { width: "100%", border: "1px solid #D8D0C4", borderRadius: 8, padding: "11px 14px", fontSize: 15, color: "#1C1810", background: "#fff", outline: "none" };
+  const btnStyle = { width: "100%", background: "#2C3E2D", color: "#fff", border: "none", borderRadius: 8, padding: "13px 0", fontSize: 15, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 };
+
+  async function signInWithGoogle() {
+    setGoogleLoading(true); setErr("");
+    const { error } = await sb.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: window.location.href },
+    });
+    if (error) { setErr(error.message); setGoogleLoading(false); }
+    // On success the page redirects — no need to setLoading(false)
+  }
+
+  async function submit() {
+    setErr(""); setMsg(""); setLoading(true);
+    try {
+      if (mode === "magic") {
+        const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.href } });
+        if (error) throw error;
+        setMsg("Check your email for a magic link!");
+      } else {
+        const { data, error } = await sb.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        onAuth(data.session);
+      }
+    } catch (e) { setErr(e.message || "Something went wrong"); }
+    setLoading(false);
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#F7F3EC", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <div style={{ width: "100%", maxWidth: 400 }}>
+        <div style={{ textAlign: "center", marginBottom: 32 }}>
+          <div style={{ fontSize: 48, marginBottom: 8 }}>📚</div>
+          <h1 style={{ fontFamily: "Georgia, serif", fontSize: 28, color: "#1C1810", marginBottom: 4 }}>My Library</h1>
+          <p style={{ color: "#9B927E", fontSize: 14 }}>Your personal book catalogue</p>
+        </div>
+
+        <div style={{ background: "#fff", borderRadius: 16, padding: 28, boxShadow: "0 2px 24px #00000010", border: "1px solid #E8E2D8" }}>
+
+          {/* Google sign-in */}
+          <button onClick={signInWithGoogle} disabled={googleLoading}
+            style={{ width: "100%", background: "#fff", border: "1.5px solid #D8D0C4", borderRadius: 8, padding: "12px 0", fontSize: 15, fontWeight: 600, color: "#1C1810", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 20 }}>
+            {googleLoading ? <Spinner color="#888" size={18} /> : (
+              <svg width="18" height="18" viewBox="0 0 48 48">
+                <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+                <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+                <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+                <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+              </svg>
+            )}
+            {googleLoading ? "Redirecting…" : "Continue with Google"}
+          </button>
+
+          {/* Divider */}
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+            <div style={{ flex: 1, height: 1, background: "#E8E2D8" }} />
+            <span style={{ fontSize: 12, color: "#9B927E" }}>or</span>
+            <div style={{ flex: 1, height: 1, background: "#E8E2D8" }} />
+          </div>
+
+          {/* Email tabs */}
+          <div style={{ display: "flex", gap: 0, marginBottom: 16, background: "#F7F3EC", borderRadius: 8, padding: 3 }}>
+            {[["login","Sign in"],["magic","Magic link"]].map(([m, label]) => (
+              <button key={m} onClick={() => { setMode(m); setErr(""); setMsg(""); }}
+                style={{ flex: 1, background: mode === m ? "#fff" : "transparent", border: "none", borderRadius: 6, padding: "7px 4px", fontSize: 12, fontWeight: mode === m ? 700 : 400, color: mode === m ? "#1C1810" : "#9B927E", cursor: "pointer", boxShadow: mode === m ? "0 1px 4px #00000015" : "none" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <input style={inputStyle} type="email" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} onKeyDown={e => e.key === "Enter" && submit()} />
+            {mode === "login" && <input style={inputStyle} type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => e.key === "Enter" && submit()} />}
+            {err && <div style={{ background: "#FEF0F0", color: "#8B3A3A", borderRadius: 6, padding: "8px 12px", fontSize: 13 }}>{err}</div>}
+            {msg && <div style={{ background: "#E8F4EE", color: "#2C6E49", borderRadius: 6, padding: "8px 12px", fontSize: 13 }}>{msg}</div>}
+            <button style={btnStyle} onClick={submit} disabled={loading}>
+              {loading ? <Spinner /> : mode === "login" ? "Sign in" : "Send magic link"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Barcode Scanner Modal ─────────────────────────────────────────────────────
+function ScannerModal({ onResult, onClose }) {
+  const videoRef = useRef();
+  const canvasRef = useRef();
+  const streamRef = useRef();
+  const rafRef = useRef();
+  const readerRef = useRef();
+  const [err, setErr] = useState("");
+  const [found, setFound] = useState(false);
+  const [showManual, setShowManual] = useState(false);
+  const [manualIsbn, setManualIsbn] = useState("");
+
+  useEffect(() => {
+    // Set up ZXing reader with all relevant formats + extra hints
+    const hints = new Map();
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+      ZXing.BarcodeFormat.EAN_13,
+      ZXing.BarcodeFormat.EAN_8,
+      ZXing.BarcodeFormat.UPC_A,
+      ZXing.BarcodeFormat.UPC_E,
+      ZXing.BarcodeFormat.CODE_128,
+    ]);
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    const reader = new ZXing.MultiFormatReader();
+    reader.setHints(hints);
+    readerRef.current = reader;
+
+    // Start camera — prefer rear camera, high resolution
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    }).then(stream => {
+      streamRef.current = stream;
+      videoRef.current.srcObject = stream;
+      videoRef.current.play();
+      videoRef.current.onloadedmetadata = () => tick();
+    }).catch(() => setErr("Camera access denied. Please allow camera use or enter the ISBN manually."));
+
+    return () => {
+      cancelAnimationFrame(rafRef.current);
+      streamRef.current?.getTracks().forEach(t => t.stop());
+    };
+  }, []);
+
+  function tick() {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || video.readyState < 2) { rafRef.current = requestAnimationFrame(tick); return; }
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0);
+
+    // Try decoding full frame
+    tryDecode(ctx, canvas.width, canvas.height);
+
+    rafRef.current = requestAnimationFrame(tick);
+  }
+
+  function tryDecode(ctx, w, h) {
+    // Try multiple crops: full frame, center strip, center crop
+    const crops = [
+      [0, 0, w, h],
+      [0, Math.floor(h * 0.3), w, Math.floor(h * 0.4)],
+      [Math.floor(w * 0.1), Math.floor(h * 0.25), Math.floor(w * 0.8), Math.floor(h * 0.5)],
+    ];
+    for (const [x, y, cw, ch] of crops) {
+      try {
+        const imageData = ctx.getImageData(x, y, cw, ch);
+        const luminance = new ZXing.RGBLuminanceSource(imageData.data, cw, ch);
+        const binary = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+        const result = readerRef.current.decode(binary);
+        if (result) {
+          cancelAnimationFrame(rafRef.current);
+          streamRef.current?.getTracks().forEach(t => t.stop());
+          setFound(true);
+          setTimeout(() => onResult(result.getText()), 300);
+          return;
+        }
+      } catch {}
+    }
+  }
+
+  function submitManual() {
+    const isbn = manualIsbn.replace(/[^0-9X]/gi, "");
+    if (isbn.length === 10 || isbn.length === 13) {
+      onResult(isbn);
+    } else {
+      setErr("Please enter a valid 10 or 13 digit ISBN.");
+    }
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "#000", zIndex: 200, display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ color: "#fff", fontSize: 16, fontWeight: 600 }}>Scan barcode</div>
+        <button onClick={onClose} style={{ background: "none", border: "none", color: "#fff", fontSize: 28, cursor: "pointer", lineHeight: 1 }}>×</button>
+      </div>
+
+      <div style={{ flex: 1, position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <video ref={videoRef} playsInline muted style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        <canvas ref={canvasRef} style={{ display: "none" }} />
+
+        {/* Viewfinder */}
+        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+          <div style={{ width: 280, height: 130, position: "relative", boxShadow: "0 0 0 2000px #00000066" }}>
+            {/* Animated scan line */}
+            {!found && <div style={{ position: "absolute", top: "50%", left: 0, right: 0, height: 2, background: "linear-gradient(90deg, transparent, #4AFF80, transparent)", animation: "scanline 1.5s ease-in-out infinite" }} />}
+            {[["top:-2px","left:-2px","borderTop","borderLeft"],["top:-2px","right:-2px","borderTop","borderRight"],["bottom:-2px","left:-2px","borderBottom","borderLeft"],["bottom:-2px","right:-2px","borderBottom","borderRight"]].map(([t, lr, b1, b2], i) => (
+              <div key={i} style={{ position: "absolute", width: 24, height: 24, [t.split(":")[0]]: t.split(":")[1], [lr.split(":")[0]]: lr.split(":")[1], [b1]: "3px solid #4AFF80", [b2]: "3px solid #4AFF80" }} />
+            ))}
+          </div>
+        </div>
+
+        {found && (
+          <div style={{ position: "absolute", inset: 0, background: "#00000088", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12 }}>
+            <div style={{ fontSize: 40 }}>✅</div>
+            <div style={{ color: "#fff", fontSize: 15, fontWeight: 600 }}>Barcode detected!</div>
+          </div>
+        )}
+      </div>
+
+      <div style={{ padding: "16px 20px", background: "#111" }}>
+        {err && <div style={{ color: "#F87171", fontSize: 13, marginBottom: 12, textAlign: "center" }}>{err}</div>}
+
+        {!showManual ? (
+          <div style={{ textAlign: "center" }}>
+            <div style={{ color: "#9B927E", fontSize: 13, marginBottom: 10 }}>Hold the back cover barcode steady inside the frame</div>
+            <button onClick={() => setShowManual(true)} style={{ background: "none", border: "none", color: "#4AFF80", fontSize: 13, cursor: "pointer", textDecoration: "underline" }}>
+              Enter ISBN manually instead
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={manualIsbn}
+              onChange={e => setManualIsbn(e.target.value)}
+              placeholder="Enter ISBN (10 or 13 digits)"
+              style={{ flex: 1, border: "1px solid #333", borderRadius: 8, padding: "10px 12px", fontSize: 14, color: "#fff", background: "#222", outline: "none" }}
+              onKeyDown={e => e.key === "Enter" && submitManual()}
+              autoFocus
+            />
+            <button onClick={submitManual} style={{ background: "#4A7C59", color: "#fff", border: "none", borderRadius: 8, padding: "10px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+              Look up
+            </button>
+          </div>
+        )}
+      </div>
+
+      <style>{`@keyframes scanline { 0%,100% { top: 20%; } 50% { top: 80%; } }`}</style>
+    </div>
+  );
+}
+
+// ── API Key Modal ─────────────────────────────────────────────────────────────
+function ApiKeyModal({ onSave, onClose, current }) {
+  const [val, setVal] = useState(current || "");
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "#00000055", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: 16 }}
+      onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={{ background: "#FDFAF6", borderRadius: 14, width: "100%", maxWidth: 440, padding: 24, boxShadow: "0 8px 40px #00000030" }}>
+        <h2 style={{ fontFamily: "Georgia, serif", fontSize: 18, color: "#1C1810", marginBottom: 8 }}>Anthropic API Key</h2>
+        <p style={{ fontSize: 13, color: "#6B6358", lineHeight: 1.6, marginBottom: 16 }}>
+          Used as a fallback to identify books from shelf photos when no barcode is present. Get a key at{" "}
+          <a href="https://console.anthropic.com" target="_blank" rel="noreferrer" style={{ color: "#2C6E49" }}>console.anthropic.com</a>.
+          Stored only in this browser.
+        </p>
+        <input type="password" value={val} onChange={e => setVal(e.target.value)} placeholder="sk-ant-..."
+          style={{ width: "100%", border: "1px solid #D8D0C4", borderRadius: 6, padding: "9px 12px", fontSize: 14, color: "#1C1810", background: "#fff", outline: "none", marginBottom: 14 }} />
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={() => onSave(val)} style={{ flex: 1, background: "#2C3E2D", color: "#fff", border: "none", borderRadius: 8, padding: "10px 0", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>Save key</button>
+          <button onClick={onClose} style={{ background: "none", border: "1px solid #D8D0C4", borderRadius: 8, padding: "10px 16px", fontSize: 14, color: "#6B6358", cursor: "pointer" }}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Book Card ─────────────────────────────────────────────────────────────────
+function BookCard({ book, onEdit, onDelete }) {
+  return (
+    <div className="fade-in" style={{ display: "flex", gap: 16, background: "#fff", border: "1px solid #E8E2D8", borderRadius: 10, padding: 16, alignItems: "flex-start" }}>
+      <div style={{ width: 60, height: 88, borderRadius: 4, background: book.cover ? "transparent" : "#EDE8DF", flexShrink: 0, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #D8D0C4" }}>
+        {book.cover ? <img src={book.cover} alt={book.title} style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <span style={{ fontSize: 24 }}>📖</span>}
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 15, color: "#1C1810", lineHeight: 1.3 }}>{book.title}</div>
+            <div style={{ color: "#6B6358", fontSize: 13, marginTop: 2 }}>{book.author}{book.year ? ` · ${book.year}` : ""}</div>
+          </div>
+          <StatusBadge status={book.status} />
+        </div>
+        {book.genre && <div style={{ marginTop: 6, fontSize: 12, color: "#9B927E", fontStyle: "italic" }}>{book.genre}</div>}
+        {book.status === "loaned" && book.loanedTo && <div style={{ marginTop: 6, fontSize: 12, color: "#8B3A3A" }}>Loaned to <strong>{book.loanedTo}</strong></div>}
+        {book.notes && <div style={{ marginTop: 6, fontSize: 12, color: "#6B6358", lineHeight: 1.5 }}>{book.notes}</div>}
+        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+          <button onClick={() => onEdit(book)} style={{ background: "none", border: "1px solid #C8C0B4", borderRadius: 6, padding: "4px 12px", fontSize: 12, color: "#4A4440", cursor: "pointer", fontWeight: 500 }}>Edit</button>
+          <button onClick={() => onDelete(book.id)} style={{ background: "none", border: "1px solid #E8D0D0", borderRadius: 6, padding: "4px 12px", fontSize: 12, color: "#8B3A3A", cursor: "pointer", fontWeight: 500 }}>Remove</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Edit Modal ────────────────────────────────────────────────────────────────
+function EditModal({ book, onSave, onClose }) {
+  const [form, setForm] = useState({ ...book });
+  const [saving, setSaving] = useState(false);
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const inputStyle = { width: "100%", border: "1px solid #D8D0C4", borderRadius: 6, padding: "8px 10px", fontSize: 14, color: "#1C1810", background: "#FDFAF6", outline: "none" };
+
+  async function handleSave() {
+    setSaving(true);
+    await onSave(form);
+    setSaving(false);
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "#00000055", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 16 }}
+      onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={{ background: "#FDFAF6", borderRadius: 14, width: "100%", maxWidth: 480, maxHeight: "90vh", overflowY: "auto", boxShadow: "0 8px 40px #00000030" }}>
+        <div style={{ padding: "20px 24px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h2 style={{ margin: 0, fontSize: 18, color: "#1C1810", fontFamily: "Georgia, serif" }}>{form.id ? "Edit book" : "Add book"}</h2>
+          <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", color: "#9B927E" }}>×</button>
+        </div>
+        <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 14 }}>
+          {[["Title","title","Book title"],["Author","author","Author name"],["Year published","year","e.g. 2018"],["Genre","genre","e.g. Fiction, History…"]].map(([label, key, placeholder]) => (
+            <div key={key}>
+              <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>{label}</label>
+              <input style={inputStyle} value={form[key] || ""} onChange={e => set(key, e.target.value)} placeholder={placeholder} />
+            </div>
+          ))}
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>Status</label>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {Object.entries(STATUS_CONFIG).map(([key, cfg]) => (
+                <button key={key} onClick={() => set("status", key)} style={{ padding: "6px 14px", borderRadius: 6, border: `1.5px solid ${form.status === key ? cfg.color : "#D8D0C4"}`, background: form.status === key ? cfg.bg : "#fff", color: form.status === key ? cfg.color : "#6B6358", fontWeight: form.status === key ? 700 : 400, fontSize: 13, cursor: "pointer" }}>
+                  {cfg.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {form.status === "loaned" && (
+            <div>
+              <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>Loaned to</label>
+              <input style={inputStyle} value={form.loanedTo || ""} onChange={e => set("loanedTo", e.target.value)} placeholder="Who has it?" />
+            </div>
+          )}
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>Notes</label>
+            <textarea style={{ ...inputStyle, resize: "vertical", minHeight: 72 }} value={form.notes || ""} onChange={e => set("notes", e.target.value)} placeholder="Any thoughts, ratings, or reminders…" />
+          </div>
+          <button onClick={handleSave} disabled={saving} style={{ background: "#2C3E2D", color: "#fff", border: "none", borderRadius: 8, padding: "12px 0", fontSize: 15, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            {saving ? <><Spinner /> Saving…</> : "Save book"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App() {
+  const [session, setSession] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [books, setBooks] = useState([]);
+  const [loadingBooks, setLoadingBooks] = useState(false);
+  const [editBook, setEditBook] = useState(null);
+  const [showScanner, setShowScanner] = useState(false);
+  const [showApiModal, setShowApiModal] = useState(false);
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("my-library-api-key") || "");
+  const [uploading, setUploading] = useState(false);
+  const [filter, setFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [error, setError] = useState("");
+  const [toast, setToast] = useState("");
+  const fileRef = useRef();
+
+  function showToast(msg) { setToast(msg); setTimeout(() => setToast(""), 3000); }
+
+  // ── Auth ──
+  useEffect(() => {
+    sb.auth.getSession().then(({ data }) => { setSession(data.session); setAuthChecked(true); });
+    const { data: { subscription } } = sb.auth.onAuthStateChange((_e, session) => setSession(session));
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // ── Load books from Supabase ──
+  useEffect(() => {
+    if (!session) return;
+    setLoadingBooks(true);
+    sb.from("books").select("*").order("created_at", { ascending: false })
+      .then(({ data, error }) => {
+        if (!error) setBooks(data || []);
+        setLoadingBooks(false);
+      });
+  }, [session]);
+
+  // ── CRUD ──
+  async function handleSave(form) {
+    const extra = form._extraBooks || [];
+    const { _extraBooks, ...clean } = form;
+    const userId = session.user.id;
+
+    if (clean.id) {
+      const { data, error } = await sb.from("books").update({ ...clean, user_id: userId }).eq("id", clean.id).select().single();
+      if (!error) { setBooks(b => b.map(x => x.id === clean.id ? data : x)); showToast("Book updated"); }
+    } else {
+      const toInsert = [clean, ...extra].map(b => ({ ...b, id: undefined, user_id: userId }));
+      const { data, error } = await sb.from("books").insert(toInsert).select();
+      if (!error) { setBooks(b => [...(data || []), ...b]); showToast(`Added ${data.length} book${data.length > 1 ? "s" : ""}`); }
+    }
+    setEditBook(null);
+  }
+
+  async function handleDelete(id) {
+    await sb.from("books").delete().eq("id", id);
+    setBooks(b => b.filter(x => x.id !== id));
+    showToast("Book removed");
+  }
+
+  // ── Barcode scan ──
+  async function handleBarcode(isbn) {
+    setShowScanner(false);
+    setUploading(true);
+    setError("");
+    showToast("Looking up ISBN…");
+    const info = await lookupISBN(isbn);
+    if (info) {
+      let cover = info.cover;
+      if (cover) {
+        // Fetch and compress the Open Library cover
+        try {
+          const res = await fetch(cover);
+          const blob = await res.blob();
+          const dataUrl = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
+          cover = await compressImage(dataUrl);
+        } catch { cover = null; }
+      }
+      setEditBook({ ...EMPTY_BOOK, ...info, cover });
+    } else {
+      setError(`No book found for ISBN ${isbn}. Try adding manually.`);
+    }
+    setUploading(false);
+  }
+
+  // ── Photo upload (Claude fallback) ──
+  async function handlePhotoUpload(file) {
+    if (!file) return;
+    if (!apiKey) { setShowApiModal(true); return; }
+    setUploading(true);
+    setError("");
+    try {
+      const base64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result.split(",")[1]); r.onerror = rej; r.readAsDataURL(file); });
+      const fullDataUrl = `data:${file.type};base64,${base64}`;
+      const coverDataUrl = await compressImage(fullDataUrl);
+      const identified = await identifyWithClaude(base64, file.type, apiKey);
+      if (!identified.length) { setError("No books found in the photo. Try the barcode scanner or add manually."); setUploading(false); return; }
+      const first = identified[0];
+      setEditBook({ ...EMPTY_BOOK, ...first, cover: coverDataUrl, _extraBooks: identified.slice(1).map(b => ({ ...EMPTY_BOOK, ...b, cover: coverDataUrl })) });
+    } catch (e) {
+      if (e.message === "invalid_key") setError("Invalid API key. Tap 🔑 to update it.");
+      else setError("Something went wrong identifying the photo.");
+    }
+    setUploading(false);
+  }
+
+  const filtered = books.filter(b => {
+    const matchFilter = filter === "all" || b.status === filter;
+    const q = search.toLowerCase();
+    return matchFilter && (!q || (b.title||"").toLowerCase().includes(q) || (b.author||"").toLowerCase().includes(q) || (b.genre||"").toLowerCase().includes(q));
+  });
+  const counts = { all: books.length, unread: 0, reading: 0, read: 0, loaned: 0 };
+  books.forEach(b => { if (counts[b.status] !== undefined) counts[b.status]++; });
+
+  if (!authChecked) return (
+    <div style={{ minHeight: "100vh", background: "#F7F3EC", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <Spinner size={32} color="#2C3E2D" />
+    </div>
+  );
+
+  if (!session) return <AuthScreen onAuth={setSession} />;
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#F7F3EC" }}>
+      {/* Header */}
+      <div style={{ background: "#2C3E2D" }}>
+        <div style={{ padding: "24px 24px 20px", maxWidth: 640, margin: "0 auto" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div>
+              <h1 style={{ margin: "0 0 4px", color: "#F0EAD6", fontFamily: "Georgia, serif", fontSize: 26, letterSpacing: "-0.01em" }}>My Library</h1>
+              <p style={{ margin: 0, color: "#8FAB8F", fontSize: 13 }}>
+                {loadingBooks ? "Loading…" : books.length === 0 ? "No books yet" : `${books.length} book${books.length === 1 ? "" : "s"} catalogued`}
+              </p>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button onClick={() => setShowApiModal(true)} title="Anthropic API key" style={{ background: "none", border: "1px solid #4A5E4A", borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 15, color: apiKey ? "#8FAB8F" : "#E8A87C" }}>{apiKey ? "🔑" : "🔑⚠️"}</button>
+              <button onClick={() => sb.auth.signOut()} title="Sign out" style={{ background: "none", border: "1px solid #4A5E4A", borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 15, color: "#8FAB8F" }}>↪</button>
+            </div>
+          </div>
+
+          {/* Action buttons */}
+          <div style={{ display: "flex", gap: 8, marginTop: 18, flexWrap: "wrap" }}>
+            <button onClick={() => setShowScanner(true)} disabled={uploading}
+              style={{ background: "#4A7C59", color: "#fff", border: "none", borderRadius: 8, padding: "9px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
+              📷 Scan barcode
+            </button>
+            <button onClick={() => fileRef.current?.click()} disabled={uploading}
+              style={{ background: "transparent", color: "#C8D8C8", border: "1.5px solid #4A5E4A", borderRadius: 8, padding: "9px 16px", fontSize: 14, fontWeight: 600, cursor: uploading ? "default" : "pointer", display: "flex", alignItems: "center", gap: 6 }}>
+              {uploading ? <><Spinner color="#8FAB8F" size={14} /> Identifying…</> : "🖼 Shelf photo"}
+            </button>
+            <button onClick={() => setEditBook({ ...EMPTY_BOOK })}
+              style={{ background: "transparent", color: "#C8D8C8", border: "1.5px solid #4A5E4A", borderRadius: 8, padding: "9px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+              + Manual
+            </button>
+          </div>
+          <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { handlePhotoUpload(e.target.files[0]); e.target.value = ""; }} />
+          {error && <div style={{ marginTop: 12, background: "#5A2A2A", color: "#F8D0D0", borderRadius: 6, padding: "8px 12px", fontSize: 13 }}>{error}</div>}
+        </div>
+      </div>
+
+      {/* Filter bar */}
+      <div style={{ background: "#EDE8DF", borderBottom: "1px solid #D8D0C4" }}>
+        <div style={{ maxWidth: 640, margin: "0 auto", padding: "0 24px", display: "flex", overflowX: "auto" }}>
+          {[["all","All"],["unread","Unread"],["reading","Reading"],["read","Read"],["loaned","Loaned"]].map(([key, label]) => (
+            <button key={key} onClick={() => setFilter(key)} style={{ background: "none", border: "none", borderBottom: filter === key ? "2px solid #2C3E2D" : "2px solid transparent", color: filter === key ? "#2C3E2D" : "#7A7260", fontWeight: filter === key ? 700 : 400, fontSize: 13, padding: "12px 14px", cursor: "pointer", whiteSpace: "nowrap" }}>
+              {label}
+              {counts[key] > 0 && <span style={{ marginLeft: 5, background: filter === key ? "#2C3E2D" : "#C4BEB4", color: "#fff", borderRadius: 10, fontSize: 10, padding: "1px 6px", fontWeight: 700 }}>{counts[key]}</span>}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Book list */}
+      <div style={{ maxWidth: 640, margin: "0 auto", padding: "20px 24px 60px" }}>
+        {books.length > 0 && (
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by title, author, or genre…"
+            style={{ width: "100%", border: "1px solid #D8D0C4", borderRadius: 8, padding: "9px 14px", fontSize: 14, color: "#1C1810", background: "#fff", marginBottom: 16, outline: "none" }} />
+        )}
+        {loadingBooks ? (
+          <div style={{ textAlign: "center", padding: "60px 0" }}><Spinner size={28} color="#9B927E" /></div>
+        ) : filtered.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "60px 0", color: "#9B927E" }}>
+            {books.length === 0
+              ? <><div style={{ fontSize: 48, marginBottom: 12 }}>📚</div><div style={{ fontSize: 16, fontWeight: 600, color: "#6B6358", marginBottom: 6 }}>Your shelves are empty</div><div style={{ fontSize: 14 }}>Scan a barcode or upload a photo to get started.</div></>
+              : <><div style={{ fontSize: 32, marginBottom: 8 }}>🔍</div><div style={{ fontSize: 14 }}>No books match your search.</div></>}
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {filtered.map(book => <BookCard key={book.id} book={book} onEdit={setEditBook} onDelete={handleDelete} />)}
+          </div>
+        )}
+      </div>
+
+      {/* Toast */}
+      {toast && (
+        <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#2C3E2D", color: "#fff", borderRadius: 8, padding: "10px 20px", fontSize: 14, fontWeight: 500, boxShadow: "0 4px 20px #00000030", zIndex: 300, whiteSpace: "nowrap", animation: "fadeIn 0.2s ease" }}>
+          {toast}
+        </div>
+      )}
+
+      {showScanner && <ScannerModal onResult={handleBarcode} onClose={() => setShowScanner(false)} />}
+      {editBook !== null && <EditModal book={editBook} onSave={handleSave} onClose={() => setEditBook(null)} />}
+      {showApiModal && <ApiKeyModal current={apiKey} onSave={k => { localStorage.setItem("my-library-api-key", k); setApiKey(k); setShowApiModal(false); showToast("API key saved"); }} onClose={() => setShowApiModal(false)} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="My Library" />
+  <meta name="theme-color" content="#2C3E2D" />
+  <title>My Library</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; margin: 0; padding: 0; }
+    body { background: #F7F3EC; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+    @keyframes scanline { 0%,100% { top: 5%; opacity: 0.7; } 50% { top: 88%; opacity: 1; } }
+    .fade-in { animation: fadeIn 0.2s ease; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+const SUPABASE_URL = "https://memoprwwpgnvqamoreql.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1lbW9wcnd3cGdudnFhbW9yZXFsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMwODU5NjQsImV4cCI6MjA5ODY2MTk2NH0.pOH5wgG0SPRResR0wxcirrZYCcNEEFsCdrWukEkAtbA";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const STATUS_CONFIG = {
+  unread:  { label: "Unread",     color: "#8B7355", bg: "#F5F0E8" },
+  reading: { label: "Reading",    color: "#2C6E49", bg: "#E8F4EE" },
+  read:    { label: "Read",       color: "#1A4A7A", bg: "#E8F0F8" },
+  loaned:  { label: "Loaned out", color: "#8B3A3A", bg: "#F8EAEA" },
+};
+
+// camelCase <-> snake_case mapping for Supabase
+function toDb(book) {
+  const { loanedTo, ...rest } = book;
+  return { ...rest, loaned_to: loanedTo || "" };
+}
+function fromDb(row) {
+  const { loaned_to, ...rest } = row;
+  return { ...rest, loanedTo: loaned_to || "" };
+}
+
+const EMPTY_BOOK = { id: null, title: "", author: "", year: "", genre: "", status: "unread", loanedTo: "", notes: "", cover: null };
+
+// ── Image compression ──────────────────────────────────────────────────────────
+function compressImage(dataUrl) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const MAX_W = 120, MAX_H = 180;
+      let { width: w, height: h } = img;
+      const ratio = Math.min(MAX_W / w, MAX_H / h, 1);
+      w = Math.round(w * ratio); h = Math.round(h * ratio);
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL("image/jpeg", 0.75));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+// ── Open Library ISBN lookup ───────────────────────────────────────────────────
+async function lookupISBN(isbn) {
+  try {
+    const res = await fetch(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`);
+    const data = await res.json();
+    const book = data[`ISBN:${isbn}`];
+    if (!book) return null;
+    return {
+      title: book.title || "",
+      author: book.authors?.[0]?.name || "",
+      year: book.publish_date ? book.publish_date.match(/\d{4}/)?.[0] || "" : "",
+      genre: book.subjects?.[0]?.name || "",
+      cover: book.cover?.medium || null,
+    };
+  } catch { return null; }
+}
+
+// ── UI Atoms ──────────────────────────────────────────────────────────────────
+function Spinner({ size = 16, color = "#fff" }) {
+  return <span style={{ display: "inline-block", width: size, height: size, border: `2px solid ${color}44`, borderTopColor: color, borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />;
+}
+
+function StatusBadge({ status }) {
+  const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.unread;
+  return <span style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.color}33`, borderRadius: 4, fontSize: 11, fontWeight: 600, letterSpacing: "0.04em", padding: "2px 8px", textTransform: "uppercase", whiteSpace: "nowrap" }}>{cfg.label}</span>;
+}
+
+// ── Auth Screen ───────────────────────────────────────────────────────────────
+function AuthScreen() {
+  const [mode, setMode] = useState("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+
+  const inputStyle = { width: "100%", border: "1px solid #D8D0C4", borderRadius: 8, padding: "11px 14px", fontSize: 15, color: "#1C1810", background: "#fff", outline: "none" };
+
+  async function signInWithGoogle() {
+    setGoogleLoading(true); setErr("");
+    const { error } = await sb.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: window.location.href },
+    });
+    if (error) { setErr(error.message); setGoogleLoading(false); }
+  }
+
+  async function submit() {
+    setErr(""); setMsg(""); setLoading(true);
+    try {
+      if (mode === "magic") {
+        const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.href } });
+        if (error) throw error;
+        setMsg("Check your email for a magic link!");
+      } else {
+        const { error } = await sb.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      }
+    } catch (e) { setErr(e.message || "Something went wrong"); }
+    setLoading(false);
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#F7F3EC", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <div style={{ width: "100%", maxWidth: 400 }}>
+        <div style={{ textAlign: "center", marginBottom: 32 }}>
+          <div style={{ fontSize: 48, marginBottom: 8 }}>📚</div>
+          <h1 style={{ fontFamily: "Georgia, serif", fontSize: 28, color: "#1C1810", marginBottom: 4 }}>My Library</h1>
+          <p style={{ color: "#9B927E", fontSize: 14 }}>Your personal book catalogue</p>
+        </div>
+        <div style={{ background: "#fff", borderRadius: 16, padding: 28, boxShadow: "0 2px 24px #00000010", border: "1px solid #E8E2D8" }}>
+          <button onClick={signInWithGoogle} disabled={googleLoading}
+            style={{ width: "100%", background: "#fff", border: "1.5px solid #D8D0C4", borderRadius: 8, padding: "12px 0", fontSize: 15, fontWeight: 600, color: "#1C1810", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 20 }}>
+            {googleLoading ? <Spinner color="#888" size={18} /> : (
+              <svg width="18" height="18" viewBox="0 0 48 48">
+                <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+                <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+                <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+                <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+              </svg>
+            )}
+            {googleLoading ? "Redirecting…" : "Continue with Google"}
+          </button>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+            <div style={{ flex: 1, height: 1, background: "#E8E2D8" }} />
+            <span style={{ fontSize: 12, color: "#9B927E" }}>or</span>
+            <div style={{ flex: 1, height: 1, background: "#E8E2D8" }} />
+          </div>
+
+          <div style={{ display: "flex", marginBottom: 16, background: "#F7F3EC", borderRadius: 8, padding: 3 }}>
+            {[["login","Sign in"],["magic","Magic link"]].map(([m, label]) => (
+              <button key={m} onClick={() => { setMode(m); setErr(""); setMsg(""); }}
+                style={{ flex: 1, background: mode === m ? "#fff" : "transparent", border: "none", borderRadius: 6, padding: "7px 4px", fontSize: 12, fontWeight: mode === m ? 700 : 400, color: mode === m ? "#1C1810" : "#9B927E", cursor: "pointer", boxShadow: mode === m ? "0 1px 4px #00000015" : "none" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <input style={inputStyle} type="email" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} onKeyDown={e => e.key === "Enter" && submit()} />
+            {mode === "login" && <input style={inputStyle} type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => e.key === "Enter" && submit()} />}
+            {err && <div style={{ background: "#FEF0F0", color: "#8B3A3A", borderRadius: 6, padding: "8px 12px", fontSize: 13 }}>{err}</div>}
+            {msg && <div style={{ background: "#E8F4EE", color: "#2C6E49", borderRadius: 6, padding: "8px 12px", fontSize: 13 }}>{msg}</div>}
+            <button onClick={submit} disabled={loading}
+              style={{ width: "100%", background: "#2C3E2D", color: "#fff", border: "none", borderRadius: 8, padding: "13px 0", fontSize: 15, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+              {loading ? <Spinner /> : mode === "login" ? "Sign in" : "Send magic link"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Barcode Scanner ───────────────────────────────────────────────────────────
+function ScannerModal({ onResult, onClose }) {
+  const videoRef = useRef();
+  const streamRef = useRef();
+  const rafRef = useRef();
+  const detectorRef = useRef();
+  const foundRef = useRef(false);
+  const [status, setStatus] = useState("starting"); // starting | scanning | notSupported | error
+  const [found, setFound] = useState(false);
+  const [showManual, setShowManual] = useState(false);
+  const [manualIsbn, setManualIsbn] = useState("");
+  const [manualErr, setManualErr] = useState("");
+
+  useEffect(() => {
+    async function start() {
+      // Use native BarcodeDetector if available (Chrome Android, Safari iOS 17+)
+      if ("BarcodeDetector" in window) {
+        try {
+          detectorRef.current = new BarcodeDetector({
+            formats: ["ean_13", "ean_8", "upc_a", "upc_e", "code_128"],
+          });
+        } catch {
+          detectorRef.current = new BarcodeDetector();
+        }
+      } else {
+        setStatus("notSupported");
+        setShowManual(true);
+        return;
+      }
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        streamRef.current = stream;
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+        setStatus("scanning");
+        scanFrame();
+      } catch {
+        setStatus("error");
+        setShowManual(true);
+      }
+    }
+
+    function scanFrame() {
+      if (foundRef.current) return;
+      const video = videoRef.current;
+      if (!video || video.readyState < 2) { rafRef.current = requestAnimationFrame(scanFrame); return; }
+
+      detectorRef.current.detect(video).then(codes => {
+        if (foundRef.current) return;
+        if (codes.length > 0) {
+          foundRef.current = true;
+          const code = codes[0].rawValue;
+          setFound(true);
+          stopCamera();
+          setTimeout(() => onResult(code), 500);
+        } else {
+          rafRef.current = requestAnimationFrame(scanFrame);
+        }
+      }).catch(() => { rafRef.current = requestAnimationFrame(scanFrame); });
+    }
+
+    start();
+    return () => stopCamera();
+  }, []);
+
+  function stopCamera() {
+    cancelAnimationFrame(rafRef.current);
+    streamRef.current?.getTracks().forEach(t => t.stop());
+  }
+
+  function handleClose() { stopCamera(); onClose(); }
+
+  function submitManual() {
+    const isbn = manualIsbn.replace(/[^0-9Xx]/g, "").toUpperCase();
+    if (isbn.length === 10 || isbn.length === 13) {
+      stopCamera();
+      onResult(isbn);
+    } else {
+      setManualErr("Please enter a valid 10 or 13 digit ISBN.");
+    }
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "#000", zIndex: 200, display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
+        <div style={{ color: "#fff", fontSize: 16, fontWeight: 600 }}>Scan barcode</div>
+        <button onClick={handleClose} style={{ background: "none", border: "none", color: "#fff", fontSize: 28, cursor: "pointer", lineHeight: 1 }}>×</button>
+      </div>
+
+      <div style={{ flex: 1, position: "relative", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <video ref={videoRef} playsInline muted style={{ width: "100%", height: "100%", objectFit: "cover", display: status === "scanning" || status === "starting" ? "block" : "none" }} />
+
+        {status === "starting" && (
+          <div style={{ position: "absolute", display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+            <Spinner size={32} color="#4AFF80" />
+            <div style={{ color: "#9B927E", fontSize: 14 }}>Starting camera…</div>
+          </div>
+        )}
+
+        {status === "notSupported" && (
+          <div style={{ color: "#9B927E", fontSize: 14, textAlign: "center", padding: "0 32px" }}>
+            <div style={{ fontSize: 36, marginBottom: 12 }}>📷</div>
+            Barcode scanning isn't supported in this browser. Please use the manual ISBN entry below.
+          </div>
+        )}
+
+        {/* Viewfinder — only show while scanning */}
+        {status === "scanning" && !found && (
+          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+            <div style={{ width: "78%", maxWidth: 310, height: 115, position: "relative", boxShadow: "0 0 0 2000px #00000066" }}>
+              <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 2, background: "linear-gradient(90deg, transparent, #4AFF80, transparent)", animation: "scanline 2s ease-in-out infinite" }} />
+              <div style={{ position: "absolute", top: -2, left: -2, width: 22, height: 22, borderTop: "3px solid #4AFF80", borderLeft: "3px solid #4AFF80" }} />
+              <div style={{ position: "absolute", top: -2, right: -2, width: 22, height: 22, borderTop: "3px solid #4AFF80", borderRight: "3px solid #4AFF80" }} />
+              <div style={{ position: "absolute", bottom: -2, left: -2, width: 22, height: 22, borderBottom: "3px solid #4AFF80", borderLeft: "3px solid #4AFF80" }} />
+              <div style={{ position: "absolute", bottom: -2, right: -2, width: 22, height: 22, borderBottom: "3px solid #4AFF80", borderRight: "3px solid #4AFF80" }} />
+            </div>
+          </div>
+        )}
+
+        {found && (
+          <div style={{ position: "absolute", inset: 0, background: "#00000099", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12 }}>
+            <div style={{ fontSize: 48 }}>✅</div>
+            <div style={{ color: "#fff", fontSize: 16, fontWeight: 600 }}>Barcode found!</div>
+            <div style={{ color: "#9B927E", fontSize: 13 }}>Looking up book…</div>
+          </div>
+        )}
+      </div>
+
+      <div style={{ padding: "14px 20px 28px", background: "#111", flexShrink: 0 }}>
+        {!showManual ? (
+          <div style={{ textAlign: "center" }}>
+            <div style={{ color: "#6B6358", fontSize: 13, marginBottom: 8 }}>Point camera at the barcode on the back cover</div>
+            <button onClick={() => setShowManual(true)} style={{ background: "none", border: "none", color: "#4AFF80", fontSize: 13, cursor: "pointer", textDecoration: "underline" }}>
+              Enter ISBN manually instead
+            </button>
+          </div>
+        ) : (
+          <div>
+            <div style={{ color: "#6B6358", fontSize: 12, marginBottom: 8 }}>ISBN is the number on the back cover, usually starting with 978</div>
+            {manualErr && <div style={{ color: "#F87171", fontSize: 13, marginBottom: 8 }}>{manualErr}</div>}
+            <div style={{ display: "flex", gap: 8 }}>
+              <input value={manualIsbn} onChange={e => { setManualIsbn(e.target.value); setManualErr(""); }}
+                placeholder="e.g. 9780142437247"
+                style={{ flex: 1, border: "1px solid #333", borderRadius: 8, padding: "10px 12px", fontSize: 14, color: "#fff", background: "#222", outline: "none" }}
+                onKeyDown={e => e.key === "Enter" && submitManual()} autoFocus />
+              <button onClick={submitManual}
+                style={{ background: "#4A7C59", color: "#fff", border: "none", borderRadius: 8, padding: "10px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+                Look up
+              </button>
+            </div>
+            {status === "scanning" && (
+              <button onClick={() => setShowManual(false)} style={{ background: "none", border: "none", color: "#6B6358", fontSize: 12, cursor: "pointer", marginTop: 8, textDecoration: "underline" }}>
+                Back to camera
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Book Card ─────────────────────────────────────────────────────────────────
+function BookCard({ book, onEdit, onDelete }) {
+  return (
+    <div className="fade-in" style={{ display: "flex", gap: 16, background: "#fff", border: "1px solid #E8E2D8", borderRadius: 10, padding: 16, alignItems: "flex-start" }}>
+      <div style={{ width: 60, height: 88, borderRadius: 4, background: book.cover ? "transparent" : "#EDE8DF", flexShrink: 0, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #D8D0C4" }}>
+        {book.cover ? <img src={book.cover} alt={book.title} style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <span style={{ fontSize: 24 }}>📖</span>}
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 15, color: "#1C1810", lineHeight: 1.3 }}>{book.title}</div>
+            <div style={{ color: "#6B6358", fontSize: 13, marginTop: 2 }}>{book.author}{book.year ? ` · ${book.year}` : ""}</div>
+          </div>
+          <StatusBadge status={book.status} />
+        </div>
+        {book.genre && <div style={{ marginTop: 6, fontSize: 12, color: "#9B927E", fontStyle: "italic" }}>{book.genre}</div>}
+        {book.status === "loaned" && book.loanedTo && <div style={{ marginTop: 6, fontSize: 12, color: "#8B3A3A" }}>Loaned to <strong>{book.loanedTo}</strong></div>}
+        {book.notes && <div style={{ marginTop: 6, fontSize: 12, color: "#6B6358", lineHeight: 1.5 }}>{book.notes}</div>}
+        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+          <button onClick={() => onEdit(book)} style={{ background: "none", border: "1px solid #C8C0B4", borderRadius: 6, padding: "4px 12px", fontSize: 12, color: "#4A4440", cursor: "pointer", fontWeight: 500 }}>Edit</button>
+          <button onClick={() => onDelete(book.id)} style={{ background: "none", border: "1px solid #E8D0D0", borderRadius: 6, padding: "4px 12px", fontSize: 12, color: "#8B3A3A", cursor: "pointer", fontWeight: 500 }}>Remove</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Edit Modal ────────────────────────────────────────────────────────────────
+function EditModal({ book, onSave, onClose }) {
+  const [form, setForm] = useState({ ...book });
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const inputStyle = { width: "100%", border: "1px solid #D8D0C4", borderRadius: 6, padding: "8px 10px", fontSize: 14, color: "#1C1810", background: "#FDFAF6", outline: "none" };
+
+  async function handleSave() {
+    if (!form.title.trim()) { setErr("Please enter a title."); return; }
+    setSaving(true);
+    setErr("");
+    await onSave(form);
+    setSaving(false);
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "#00000055", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 16 }}
+      onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={{ background: "#FDFAF6", borderRadius: 14, width: "100%", maxWidth: 480, maxHeight: "90vh", overflowY: "auto", boxShadow: "0 8px 40px #00000030" }}>
+        <div style={{ padding: "20px 24px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h2 style={{ margin: 0, fontSize: 18, color: "#1C1810", fontFamily: "Georgia, serif" }}>{form.id ? "Edit book" : "Add book"}</h2>
+          <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", color: "#9B927E" }}>×</button>
+        </div>
+        <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 14 }}>
+          {[["Title","title","Book title"],["Author","author","Author name"],["Year","year","e.g. 2018"],["Genre","genre","e.g. Fiction, History…"]].map(([label, key, placeholder]) => (
+            <div key={key}>
+              <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>{label}</label>
+              <input style={inputStyle} value={form[key] || ""} onChange={e => set(key, e.target.value)} placeholder={placeholder} />
+            </div>
+          ))}
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>Status</label>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {Object.entries(STATUS_CONFIG).map(([key, cfg]) => (
+                <button key={key} onClick={() => set("status", key)} style={{ padding: "6px 14px", borderRadius: 6, border: `1.5px solid ${form.status === key ? cfg.color : "#D8D0C4"}`, background: form.status === key ? cfg.bg : "#fff", color: form.status === key ? cfg.color : "#6B6358", fontWeight: form.status === key ? 700 : 400, fontSize: 13, cursor: "pointer" }}>
+                  {cfg.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {form.status === "loaned" && (
+            <div>
+              <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>Loaned to</label>
+              <input style={inputStyle} value={form.loanedTo || ""} onChange={e => set("loanedTo", e.target.value)} placeholder="Who has it?" />
+            </div>
+          )}
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>Notes</label>
+            <textarea style={{ ...inputStyle, resize: "vertical", minHeight: 72 }} value={form.notes || ""} onChange={e => set("notes", e.target.value)} placeholder="Any thoughts, ratings, or reminders…" />
+          </div>
+          {err && <div style={{ background: "#FEF0F0", color: "#8B3A3A", borderRadius: 6, padding: "8px 12px", fontSize: 13 }}>{err}</div>}
+          <button onClick={handleSave} disabled={saving}
+            style={{ background: "#2C3E2D", color: "#fff", border: "none", borderRadius: 8, padding: "12px 0", fontSize: 15, fontWeight: 600, cursor: saving ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            {saving ? <><Spinner /> Saving…</> : "Save book"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Genre Manager Modal ───────────────────────────────────────────────────────
+function GenreManagerModal({ books, onUpdate, onClose }) {
+  const genres = Array.from(new Set(books.map(b => b.genre).filter(Boolean))).sort();
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  const toValue = to === "__custom__" ? customTo.trim() : to;
+  const affectedCount = from ? books.filter(b => b.genre === from).length : 0;
+
+  async function handleMerge() {
+    if (!from) { setErr("Please select a genre to replace."); return; }
+    if (!toValue) { setErr("Please select or enter a replacement genre."); return; }
+    if (from === toValue) { setErr("The genres are the same — please choose a different replacement."); return; }
+    setSaving(true); setErr("");
+    const { error } = await sb.from("books").update({ genre: toValue }).eq("genre", from);
+    if (error) { setErr("Something went wrong: " + error.message); setSaving(false); return; }
+    onUpdate(from, toValue);
+    setSaving(false);
+    setFrom(""); setTo(""); setCustomTo("");
+  }
+
+  const selectStyle = { width: "100%", border: "1px solid #D8D0C4", borderRadius: 8, padding: "9px 12px", fontSize: 14, color: "#1C1810", background: "#FDFAF6", outline: "none", appearance: "none" };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "#00000055", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 150, padding: 16 }}
+      onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={{ background: "#FDFAF6", borderRadius: 14, width: "100%", maxWidth: 460, boxShadow: "0 8px 40px #00000030", overflow: "hidden" }}>
+        <div style={{ padding: "20px 24px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid #E8E2D8" }}>
+          <h2 style={{ margin: 0, fontSize: 18, color: "#1C1810", fontFamily: "Georgia, serif" }}>Manage genres</h2>
+          <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", color: "#9B927E" }}>×</button>
+        </div>
+
+        {/* Genre list overview */}
+        <div style={{ padding: "16px 24px", borderBottom: "1px solid #E8E2D8", maxHeight: 180, overflowY: "auto" }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 10 }}>Current genres</div>
+          {genres.length === 0
+            ? <div style={{ fontSize: 13, color: "#9B927E" }}>No genres yet.</div>
+            : genres.map(g => {
+                const count = books.filter(b => b.genre === g).length;
+                return (
+                  <div key={g} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "5px 0", borderBottom: "1px solid #F0EAE0" }}>
+                    <span style={{ fontSize: 14, color: "#1C1810" }}>{g}</span>
+                    <span style={{ fontSize: 12, color: "#9B927E" }}>{count} book{count !== 1 ? "s" : ""}</span>
+                  </div>
+                );
+              })}
+        </div>
+
+        {/* Merge / replace */}
+        <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ fontSize: 13, color: "#6B6358", lineHeight: 1.5 }}>
+            Replace one genre with another. All books with the old genre will be updated automatically.
+          </div>
+
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+              Replace this genre
+            </label>
+            <div style={{ position: "relative" }}>
+              <select value={from} onChange={e => { setFrom(e.target.value); setErr(""); }} style={selectStyle}>
+                <option value="">Select a genre…</option>
+                {genres.map(g => <option key={g} value={g}>{g}</option>)}
+              </select>
+              <span style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none", color: "#9B927E", fontSize: 11 }}>▾</span>
+            </div>
+            {from && <div style={{ marginTop: 5, fontSize: 12, color: "#8B7355" }}>Will update {affectedCount} book{affectedCount !== 1 ? "s" : ""}</div>}
+          </div>
+
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+              With this genre
+            </label>
+            <div style={{ position: "relative" }}>
+              <select value={to} onChange={e => { setTo(e.target.value); setErr(""); }} style={selectStyle}>
+                <option value="">Select a genre…</option>
+                {genres.filter(g => g !== from).map(g => <option key={g} value={g}>{g}</option>)}
+                <option value="__custom__">+ Enter a new genre name</option>
+              </select>
+              <span style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none", color: "#9B927E", fontSize: 11 }}>▾</span>
+            </div>
+            {to === "__custom__" && (
+              <input value={customTo} onChange={e => setCustomTo(e.target.value)} placeholder="New genre name…"
+                style={{ ...selectStyle, marginTop: 8 }} autoFocus />
+            )}
+          </div>
+
+          {err && <div style={{ background: "#FEF0F0", color: "#8B3A3A", borderRadius: 6, padding: "8px 12px", fontSize: 13 }}>{err}</div>}
+
+          <button onClick={handleMerge} disabled={saving || !from || !toValue}
+            style={{ background: from && toValue ? "#2C3E2D" : "#C4BEB4", color: "#fff", border: "none", borderRadius: 8, padding: "12px 0", fontSize: 15, fontWeight: 600, cursor: from && toValue ? "pointer" : "default", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            {saving ? <><Spinner /> Updating…</> : `Replace genre`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App() {
+  const [session, setSession] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [books, setBooks] = useState([]);
+  const [loadingBooks, setLoadingBooks] = useState(false);
+  const [editBook, setEditBook] = useState(null);
+  const [showScanner, setShowScanner] = useState(false);
+  const [lookingUp, setLookingUp] = useState(false);
+  const [filter, setFilter] = useState("all");
+  const [genreFilter, setGenreFilter] = useState("all");
+  const [authorFilter, setAuthorFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [showStats, setShowStats] = useState(false);
+  const [showGenreManager, setShowGenreManager] = useState(false);
+  const [error, setError] = useState("");
+  const [toast, setToast] = useState("");
+
+  function showToast(msg) { setToast(msg); setTimeout(() => setToast(""), 3000); }
+
+  useEffect(() => {
+    sb.auth.getSession().then(({ data }) => { setSession(data.session); setAuthChecked(true); });
+    const { data: { subscription } } = sb.auth.onAuthStateChange((_e, s) => setSession(s));
+    return () => subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!session) return;
+    setLoadingBooks(true);
+    sb.from("books").select("*").order("created_at", { ascending: false })
+      .then(({ data, error }) => {
+        if (!error) setBooks((data || []).map(fromDb));
+        else setError("Failed to load books: " + error.message);
+        setLoadingBooks(false);
+      });
+  }, [session]);
+
+  async function handleSave(form) {
+    const userId = session.user.id;
+    const dbRow = { ...toDb(form), user_id: userId };
+    delete dbRow.id;
+
+    if (form.id) {
+      const { data, error } = await sb.from("books").update(toDb(form)).eq("id", form.id).select().single();
+      if (error) { showToast("❌ Save failed: " + error.message); return; }
+      setBooks(b => b.map(x => x.id === form.id ? fromDb(data) : x));
+      showToast("Book updated ✓");
+    } else {
+      const { data, error } = await sb.from("books").insert([dbRow]).select();
+      if (error) { showToast("❌ Save failed: " + error.message); return; }
+      setBooks(b => [...(data || []).map(fromDb), ...b]);
+      showToast("Book added ✓");
+    }
+    setEditBook(null);
+  }
+
+  function handleGenreUpdate(oldGenre, newGenre) {
+    setBooks(b => b.map(book => book.genre === oldGenre ? { ...book, genre: newGenre } : book));
+    if (genreFilter === oldGenre) setGenreFilter(newGenre);
+    showToast(`Replaced "${oldGenre}" with "${newGenre}" ✓`);
+  }
+
+  async function handleDelete(id) {
+    const { error } = await sb.from("books").delete().eq("id", id);
+    if (error) { showToast("❌ Delete failed"); return; }
+    setBooks(b => b.filter(x => x.id !== id));
+    showToast("Book removed");
+  }
+
+  async function handleBarcode(isbn) {
+    setShowScanner(false);
+    setLookingUp(true);
+    setError("");
+    showToast("Looking up ISBN…");
+    const info = await lookupISBN(isbn);
+    if (info) {
+      let cover = info.cover;
+      if (cover) {
+        try {
+          const res = await fetch(cover);
+          const blob = await res.blob();
+          const dataUrl = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
+          cover = await compressImage(dataUrl);
+        } catch { cover = null; }
+      }
+      setEditBook({ ...EMPTY_BOOK, ...info, cover });
+    } else {
+      setError(`No book found for ISBN ${isbn}. You can add it manually.`);
+    }
+    setLookingUp(false);
+  }
+
+  const genres = ["all", ...Array.from(new Set(books.map(b => b.genre).filter(Boolean))).sort()];
+  const authors = ["all", ...Array.from(new Set(books.map(b => b.author).filter(Boolean))).sort()];
+
+  const filtered = books.filter(b => {
+    const matchStatus = filter === "all" || b.status === filter;
+    const matchGenre = genreFilter === "all" || (b.genre||"") === genreFilter;
+    const matchAuthor = authorFilter === "all" || (b.author||"") === authorFilter;
+    const q = search.toLowerCase();
+    const matchSearch = !q || (b.title||"").toLowerCase().includes(q) || (b.author||"").toLowerCase().includes(q) || (b.genre||"").toLowerCase().includes(q);
+    return matchStatus && matchGenre && matchAuthor && matchSearch;
+  });
+  const counts = { all: books.length, unread: 0, reading: 0, read: 0, loaned: 0 };
+  books.forEach(b => { if (counts[b.status] !== undefined) counts[b.status]++; });
+  const hasActiveFilters = genreFilter !== "all" || authorFilter !== "all" || search !== "";
+
+  const total = books.length || 1;
+  const genreCounts = {};
+  books.forEach(b => { const g = b.genre || "Unknown"; genreCounts[g] = (genreCounts[g] || 0) + 1; });
+  const genreList = Object.entries(genreCounts).sort((a, b) => b[1] - a[1]);
+
+  if (!authChecked) return <div style={{ minHeight: "100vh", background: "#F7F3EC", display: "flex", alignItems: "center", justifyContent: "center" }}><Spinner size={32} color="#2C3E2D" /></div>;
+  if (!session) return <AuthScreen />;
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#F7F3EC" }}>
+      <div style={{ background: "#2C3E2D" }}>
+        <div style={{ padding: "24px 24px 20px", maxWidth: 640, margin: "0 auto" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div>
+              <h1 style={{ margin: "0 0 4px", color: "#F0EAD6", fontFamily: "Georgia, serif", fontSize: 26, letterSpacing: "-0.01em" }}>My Library</h1>
+              <p style={{ margin: 0, color: "#8FAB8F", fontSize: 13 }}>
+                {loadingBooks ? "Loading…" : books.length === 0 ? "No books yet" : `${books.length} book${books.length === 1 ? "" : "s"} catalogued`}
+              </p>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {books.length > 0 && (
+                <button onClick={() => setShowStats(s => !s)} title="Stats"
+                  style={{ background: showStats ? "#4A7C59" : "none", border: "1px solid #4A5E4A", borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 15, color: showStats ? "#fff" : "#8FAB8F" }}>📊</button>
+              )}
+              <button onClick={() => sb.auth.signOut()} title="Sign out"
+                style={{ background: "none", border: "1px solid #4A5E4A", borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 15, color: "#8FAB8F" }}>↪</button>
+            </div>
+          </div>
+
+          {/* Stats panel */}
+          {showStats && books.length > 0 && (
+            <div style={{ marginTop: 18, background: "#243327", borderRadius: 12, padding: 16 }}>
+              {/* Status breakdown */}
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ color: "#8FAB8F", fontSize: 11, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 10 }}>Reading status</div>
+                {[
+                  ["Read", counts.read, "#4A9B6F"],
+                  ["Reading", counts.reading, "#6BA8D4"],
+                  ["Unread", counts.unread, "#C4A882"],
+                  ["Loaned out", counts.loaned, "#D47A7A"],
+                ].map(([label, count, color]) => count > 0 && (
+                  <div key={label} style={{ marginBottom: 7 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                      <span style={{ color: "#C8D8C8", fontSize: 12 }}>{label}</span>
+                      <span style={{ color: "#8FAB8F", fontSize: 12 }}>{count} · {Math.round(count / total * 100)}%</span>
+                    </div>
+                    <div style={{ height: 6, background: "#1A2B1D", borderRadius: 3, overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${count / total * 100}%`, background: color, borderRadius: 3, transition: "width 0.4s ease" }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Genre breakdown */}
+              {genreList.length > 0 && (
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                    <div style={{ color: "#8FAB8F", fontSize: 11, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>By genre</div>
+                    <button onClick={() => setShowGenreManager(true)}
+                      style={{ background: "none", border: "1px solid #4A5E4A", borderRadius: 6, padding: "3px 10px", fontSize: 11, color: "#8FAB8F", cursor: "pointer" }}>
+                      Manage genres
+                    </button>
+                  </div>
+                  {genreList.map(([genre, count]) => (
+                    <div key={genre} style={{ marginBottom: 7 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                        <span style={{ color: "#C8D8C8", fontSize: 12 }}>{genre}</span>
+                        <span style={{ color: "#8FAB8F", fontSize: 12 }}>{count} · {Math.round(count / total * 100)}%</span>
+                      </div>
+                      <div style={{ height: 6, background: "#1A2B1D", borderRadius: 3, overflow: "hidden" }}>
+                        <div style={{ height: "100%", width: `${count / total * 100}%`, background: "#7A9E8A", borderRadius: 3, transition: "width 0.4s ease" }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 8, marginTop: 18, flexWrap: "wrap" }}>
+            <button onClick={() => setShowScanner(true)} disabled={lookingUp}
+              style={{ background: "#4A7C59", color: "#fff", border: "none", borderRadius: 8, padding: "9px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
+              {lookingUp ? <><Spinner size={14} /> Looking up…</> : <>📷 Scan barcode</>}
+            </button>
+            <button onClick={() => setEditBook({ ...EMPTY_BOOK })}
+              style={{ background: "transparent", color: "#C8D8C8", border: "1.5px solid #4A5E4A", borderRadius: 8, padding: "9px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+              + Add manually
+            </button>
+          </div>
+          {error && <div style={{ marginTop: 12, background: "#5A2A2A", color: "#F8D0D0", borderRadius: 6, padding: "8px 12px", fontSize: 13 }}>{error}</div>}
+        </div>
+      </div>
+
+      {/* Status filter tabs */}
+      <div style={{ background: "#EDE8DF", borderBottom: "1px solid #D8D0C4" }}>
+        <div style={{ maxWidth: 640, margin: "0 auto", padding: "0 24px", display: "flex", overflowX: "auto" }}>
+          {[["all","All"],["unread","Unread"],["reading","Reading"],["read","Read"],["loaned","Loaned"]].map(([key, label]) => (
+            <button key={key} onClick={() => setFilter(key)} style={{ background: "none", border: "none", borderBottom: filter === key ? "2px solid #2C3E2D" : "2px solid transparent", color: filter === key ? "#2C3E2D" : "#7A7260", fontWeight: filter === key ? 700 : 400, fontSize: 13, padding: "12px 14px", cursor: "pointer", whiteSpace: "nowrap" }}>
+              {label}
+              {counts[key] > 0 && <span style={{ marginLeft: 5, background: filter === key ? "#2C3E2D" : "#C4BEB4", color: "#fff", borderRadius: 10, fontSize: 10, padding: "1px 6px", fontWeight: 700 }}>{counts[key]}</span>}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 640, margin: "0 auto", padding: "16px 24px 60px" }}>
+
+        {/* Search + dropdowns */}
+        {books.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by title, author, or genre…"
+              style={{ width: "100%", border: "1px solid #D8D0C4", borderRadius: 8, padding: "9px 14px", fontSize: 14, color: "#1C1810", background: "#fff", outline: "none" }} />
+
+            <div style={{ display: "flex", gap: 8 }}>
+              {/* Genre dropdown */}
+              <div style={{ flex: 1, position: "relative" }}>
+                <select value={genreFilter} onChange={e => setGenreFilter(e.target.value)}
+                  style={{ width: "100%", appearance: "none", border: `1px solid ${genreFilter !== "all" ? "#2C3E2D" : "#D8D0C4"}`, borderRadius: 8, padding: "8px 32px 8px 12px", fontSize: 13, color: genreFilter !== "all" ? "#2C3E2D" : "#6B6358", background: genreFilter !== "all" ? "#E8F4EE" : "#fff", fontWeight: genreFilter !== "all" ? 600 : 400, cursor: "pointer", outline: "none" }}>
+                  <option value="all">All genres</option>
+                  {genres.filter(g => g !== "all").map(g => <option key={g} value={g}>{g}</option>)}
+                </select>
+                <span style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none", color: "#9B927E", fontSize: 11 }}>▾</span>
+              </div>
+
+              {/* Author dropdown */}
+              <div style={{ flex: 1, position: "relative" }}>
+                <select value={authorFilter} onChange={e => setAuthorFilter(e.target.value)}
+                  style={{ width: "100%", appearance: "none", border: `1px solid ${authorFilter !== "all" ? "#2C3E2D" : "#D8D0C4"}`, borderRadius: 8, padding: "8px 32px 8px 12px", fontSize: 13, color: authorFilter !== "all" ? "#2C3E2D" : "#6B6358", background: authorFilter !== "all" ? "#E8F4EE" : "#fff", fontWeight: authorFilter !== "all" ? 600 : 400, cursor: "pointer", outline: "none" }}>
+                  <option value="all">All authors</option>
+                  {authors.filter(a => a !== "all").map(a => <option key={a} value={a}>{a}</option>)}
+                </select>
+                <span style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none", color: "#9B927E", fontSize: 11 }}>▾</span>
+              </div>
+            </div>
+
+            {/* Clear filters */}
+            {hasActiveFilters && (
+              <button onClick={() => { setSearch(""); setGenreFilter("all"); setAuthorFilter("all"); }}
+                style={{ alignSelf: "flex-start", background: "none", border: "none", color: "#8B3A3A", fontSize: 12, cursor: "pointer", textDecoration: "underline", padding: 0 }}>
+                Clear filters
+              </button>
+            )}
+          </div>
+        )}
+
+        {loadingBooks ? (
+          <div style={{ textAlign: "center", padding: "60px 0" }}><Spinner size={28} color="#9B927E" /></div>
+        ) : filtered.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "60px 0", color: "#9B927E" }}>
+            {books.length === 0
+              ? <><div style={{ fontSize: 48, marginBottom: 12 }}>📚</div><div style={{ fontSize: 16, fontWeight: 600, color: "#6B6358", marginBottom: 6 }}>Your shelves are empty</div><div style={{ fontSize: 14 }}>Scan a barcode or add a book manually to get started.</div></>
+              : <><div style={{ fontSize: 32, marginBottom: 8 }}>🔍</div><div style={{ fontSize: 14 }}>No books match your filters.</div></>}
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {filtered.map(book => <BookCard key={book.id} book={book} onEdit={setEditBook} onDelete={handleDelete} />)}
+          </div>
+        )}
+      </div>
+
+      {toast && (
+        <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#2C3E2D", color: "#fff", borderRadius: 8, padding: "10px 20px", fontSize: 14, fontWeight: 500, boxShadow: "0 4px 20px #00000030", zIndex: 300, whiteSpace: "nowrap", animation: "fadeIn 0.2s ease" }}>
+          {toast}
+        </div>
+      )}
+
+      {showScanner && <ScannerModal onResult={handleBarcode} onClose={() => setShowScanner(false)} />}
+      {editBook !== null && <EditModal book={editBook} onSave={handleSave} onClose={() => setEditBook(null)} />}
+      {showGenreManager && <GenreManagerModal books={books} onUpdate={handleGenreUpdate} onClose={() => setShowGenreManager(false)} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

@@ -12,7 +12,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.19.1/umd/index.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/quagga@0.12.1/dist/quagga.min.js"></script>
   <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; margin: 0; padding: 0; }
     body { background: #F7F3EC; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
@@ -201,90 +201,61 @@ function AuthScreen({ onAuth }) {
 
 // ── Barcode Scanner Modal ─────────────────────────────────────────────────────
 function ScannerModal({ onResult, onClose }) {
-  const videoRef = useRef();
-  const canvasRef = useRef();
-  const streamRef = useRef();
-  const rafRef = useRef();
-  const readerRef = useRef();
+  const mountRef = useRef();
   const [err, setErr] = useState("");
   const [found, setFound] = useState(false);
   const [showManual, setShowManual] = useState(false);
   const [manualIsbn, setManualIsbn] = useState("");
+  const foundRef = useRef(false);
 
   useEffect(() => {
-    // Set up ZXing reader with all relevant formats + extra hints
-    const hints = new Map();
-    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
-      ZXing.BarcodeFormat.EAN_13,
-      ZXing.BarcodeFormat.EAN_8,
-      ZXing.BarcodeFormat.UPC_A,
-      ZXing.BarcodeFormat.UPC_E,
-      ZXing.BarcodeFormat.CODE_128,
-    ]);
-    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-    const reader = new ZXing.MultiFormatReader();
-    reader.setHints(hints);
-    readerRef.current = reader;
+    Quagga.init({
+      inputStream: {
+        name: "Live",
+        type: "LiveStream",
+        target: mountRef.current,
+        constraints: {
+          facingMode: "environment",
+          width: { min: 640, ideal: 1280 },
+          height: { min: 480, ideal: 720 },
+        },
+        area: { top: "20%", right: "5%", left: "5%", bottom: "20%" },
+      },
+      locator: { patchSize: "medium", halfSample: false },
+      numOfWorkers: 2,
+      frequency: 15,
+      decoder: {
+        readers: ["ean_reader", "ean_8_reader", "upc_reader", "upc_e_reader", "code_128_reader"],
+        multiple: false,
+      },
+      locate: true,
+    }, (err) => {
+      if (err) { setErr("Camera access denied. Use manual entry below."); return; }
+      Quagga.start();
+    });
 
-    // Start camera — prefer rear camera, high resolution
-    navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }
-    }).then(stream => {
-      streamRef.current = stream;
-      videoRef.current.srcObject = stream;
-      videoRef.current.play();
-      videoRef.current.onloadedmetadata = () => tick();
-    }).catch(() => setErr("Camera access denied. Please allow camera use or enter the ISBN manually."));
+    Quagga.onDetected((data) => {
+      if (foundRef.current) return;
+      const code = data.result.codeResult.code;
+      // Filter out low-confidence results
+      const errors = data.result.codeResult.decodedCodes
+        .filter(x => x.error !== undefined)
+        .map(x => x.error);
+      const avgErr = errors.reduce((a, b) => a + b, 0) / (errors.length || 1);
+      if (avgErr > 0.25) return;
+      foundRef.current = true;
+      setFound(true);
+      Quagga.stop();
+      setTimeout(() => onResult(code), 400);
+    });
 
-    return () => {
-      cancelAnimationFrame(rafRef.current);
-      streamRef.current?.getTracks().forEach(t => t.stop());
-    };
+    return () => { try { Quagga.stop(); } catch {} };
   }, []);
 
-  function tick() {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas || video.readyState < 2) { rafRef.current = requestAnimationFrame(tick); return; }
-
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0);
-
-    // Try decoding full frame
-    tryDecode(ctx, canvas.width, canvas.height);
-
-    rafRef.current = requestAnimationFrame(tick);
-  }
-
-  function tryDecode(ctx, w, h) {
-    // Try multiple crops: full frame, center strip, center crop
-    const crops = [
-      [0, 0, w, h],
-      [0, Math.floor(h * 0.3), w, Math.floor(h * 0.4)],
-      [Math.floor(w * 0.1), Math.floor(h * 0.25), Math.floor(w * 0.8), Math.floor(h * 0.5)],
-    ];
-    for (const [x, y, cw, ch] of crops) {
-      try {
-        const imageData = ctx.getImageData(x, y, cw, ch);
-        const luminance = new ZXing.RGBLuminanceSource(imageData.data, cw, ch);
-        const binary = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
-        const result = readerRef.current.decode(binary);
-        if (result) {
-          cancelAnimationFrame(rafRef.current);
-          streamRef.current?.getTracks().forEach(t => t.stop());
-          setFound(true);
-          setTimeout(() => onResult(result.getText()), 300);
-          return;
-        }
-      } catch {}
-    }
-  }
-
   function submitManual() {
-    const isbn = manualIsbn.replace(/[^0-9X]/gi, "");
+    const isbn = manualIsbn.replace(/[^0-9Xx]/g, "").toUpperCase();
     if (isbn.length === 10 || isbn.length === 13) {
+      Quagga.stop();
       onResult(isbn);
     } else {
       setErr("Please enter a valid 10 or 13 digit ISBN.");
@@ -293,62 +264,58 @@ function ScannerModal({ onResult, onClose }) {
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "#000", zIndex: 200, display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
         <div style={{ color: "#fff", fontSize: 16, fontWeight: 600 }}>Scan barcode</div>
-        <button onClick={onClose} style={{ background: "none", border: "none", color: "#fff", fontSize: 28, cursor: "pointer", lineHeight: 1 }}>×</button>
+        <button onClick={() => { try { Quagga.stop(); } catch {} onClose(); }} style={{ background: "none", border: "none", color: "#fff", fontSize: 28, cursor: "pointer", lineHeight: 1 }}>×</button>
       </div>
 
-      <div style={{ flex: 1, position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
-        <video ref={videoRef} playsInline muted style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-        <canvas ref={canvasRef} style={{ display: "none" }} />
+      {/* Quagga mounts video here */}
+      <div ref={mountRef} style={{ flex: 1, position: "relative", overflow: "hidden" }} />
 
-        {/* Viewfinder */}
-        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
-          <div style={{ width: 280, height: 130, position: "relative", boxShadow: "0 0 0 2000px #00000066" }}>
-            {/* Animated scan line */}
-            {!found && <div style={{ position: "absolute", top: "50%", left: 0, right: 0, height: 2, background: "linear-gradient(90deg, transparent, #4AFF80, transparent)", animation: "scanline 1.5s ease-in-out infinite" }} />}
-            {[["top:-2px","left:-2px","borderTop","borderLeft"],["top:-2px","right:-2px","borderTop","borderRight"],["bottom:-2px","left:-2px","borderBottom","borderLeft"],["bottom:-2px","right:-2px","borderBottom","borderRight"]].map(([t, lr, b1, b2], i) => (
-              <div key={i} style={{ position: "absolute", width: 24, height: 24, [t.split(":")[0]]: t.split(":")[1], [lr.split(":")[0]]: lr.split(":")[1], [b1]: "3px solid #4AFF80", [b2]: "3px solid #4AFF80" }} />
-            ))}
-          </div>
+      {/* Viewfinder overlay */}
+      <div style={{ position: "absolute", top: "60px", left: 0, right: 0, bottom: "120px", display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+        <div style={{ width: "80%", maxWidth: 320, height: 110, position: "relative", boxShadow: "0 0 0 2000px #00000066" }}>
+          {!found && <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 2, background: "linear-gradient(90deg, transparent, #4AFF80, transparent)", animation: "scanline 2s ease-in-out infinite" }} />}
+          {[{t:"-2px",l:"-2px",bt:"borderTop",bl:"borderLeft"},{t:"-2px",r:"-2px",bt:"borderTop",bl:"borderRight"},{b:"-2px",l:"-2px",bt:"borderBottom",bl:"borderLeft"},{b:"-2px",r:"-2px",bt:"borderBottom",bl:"borderRight"}].map((c, i) => (
+            <div key={i} style={{ position: "absolute", width: 22, height: 22, ...(c.t ? {top:c.t}:{}), ...(c.b ? {bottom:c.b}:{}), ...(c.l ? {left:c.l}:{}), ...(c.r ? {right:c.r}:{}), [c.bt]: "3px solid #4AFF80", [c.bl]: "3px solid #4AFF80" }} />
+          ))}
         </div>
-
-        {found && (
-          <div style={{ position: "absolute", inset: 0, background: "#00000088", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12 }}>
-            <div style={{ fontSize: 40 }}>✅</div>
-            <div style={{ color: "#fff", fontSize: 15, fontWeight: 600 }}>Barcode detected!</div>
-          </div>
-        )}
       </div>
 
-      <div style={{ padding: "16px 20px", background: "#111" }}>
-        {err && <div style={{ color: "#F87171", fontSize: 13, marginBottom: 12, textAlign: "center" }}>{err}</div>}
+      {found && (
+        <div style={{ position: "absolute", inset: 0, background: "#00000099", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, zIndex: 10 }}>
+          <div style={{ fontSize: 48 }}>✅</div>
+          <div style={{ color: "#fff", fontSize: 16, fontWeight: 600 }}>Barcode found!</div>
+          <div style={{ color: "#9B927E", fontSize: 13 }}>Looking up book…</div>
+        </div>
+      )}
 
+      <div style={{ padding: "14px 20px 20px", background: "#111", flexShrink: 0 }}>
+        {err && <div style={{ color: "#F87171", fontSize: 13, marginBottom: 10, textAlign: "center" }}>{err}</div>}
         {!showManual ? (
           <div style={{ textAlign: "center" }}>
-            <div style={{ color: "#9B927E", fontSize: 13, marginBottom: 10 }}>Hold the back cover barcode steady inside the frame</div>
+            <div style={{ color: "#6B6358", fontSize: 13, marginBottom: 8 }}>Point at the barcode on the back cover</div>
             <button onClick={() => setShowManual(true)} style={{ background: "none", border: "none", color: "#4AFF80", fontSize: 13, cursor: "pointer", textDecoration: "underline" }}>
               Enter ISBN manually instead
             </button>
           </div>
         ) : (
           <div style={{ display: "flex", gap: 8 }}>
-            <input
-              value={manualIsbn}
-              onChange={e => setManualIsbn(e.target.value)}
-              placeholder="Enter ISBN (10 or 13 digits)"
+            <input value={manualIsbn} onChange={e => setManualIsbn(e.target.value)} placeholder="ISBN (10 or 13 digits)"
               style={{ flex: 1, border: "1px solid #333", borderRadius: 8, padding: "10px 12px", fontSize: 14, color: "#fff", background: "#222", outline: "none" }}
-              onKeyDown={e => e.key === "Enter" && submitManual()}
-              autoFocus
-            />
+              onKeyDown={e => e.key === "Enter" && submitManual()} autoFocus />
             <button onClick={submitManual} style={{ background: "#4A7C59", color: "#fff", border: "none", borderRadius: 8, padding: "10px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
               Look up
             </button>
           </div>
         )}
       </div>
-
-      <style>{`@keyframes scanline { 0%,100% { top: 20%; } 50% { top: 80%; } }`}</style>
+      <style>{`
+        #interactive.quagga-viewport { width: 100%; height: 100%; }
+        #interactive.quagga-viewport video { width: 100%; height: 100%; object-fit: cover; }
+        #interactive.quagga-viewport canvas { display: none; }
+        @keyframes scanline { 0%,100% { top: 10%; opacity: 0.6; } 50% { top: 85%; opacity: 1; } }
+      `}</style>
     </div>
   );
 }

@@ -448,7 +448,10 @@ function App() {
   const [showScanner, setShowScanner] = useState(false);
   const [lookingUp, setLookingUp] = useState(false);
   const [filter, setFilter] = useState("all");
+  const [genreFilter, setGenreFilter] = useState("all");
+  const [authorFilter, setAuthorFilter] = useState("all");
   const [search, setSearch] = useState("");
+  const [showStats, setShowStats] = useState(false);
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
 
@@ -520,13 +523,25 @@ function App() {
     setLookingUp(false);
   }
 
+  const genres = ["all", ...Array.from(new Set(books.map(b => b.genre).filter(Boolean))).sort()];
+  const authors = ["all", ...Array.from(new Set(books.map(b => b.author).filter(Boolean))).sort()];
+
   const filtered = books.filter(b => {
-    const matchFilter = filter === "all" || b.status === filter;
+    const matchStatus = filter === "all" || b.status === filter;
+    const matchGenre = genreFilter === "all" || (b.genre||"") === genreFilter;
+    const matchAuthor = authorFilter === "all" || (b.author||"") === authorFilter;
     const q = search.toLowerCase();
-    return matchFilter && (!q || (b.title||"").toLowerCase().includes(q) || (b.author||"").toLowerCase().includes(q) || (b.genre||"").toLowerCase().includes(q));
+    const matchSearch = !q || (b.title||"").toLowerCase().includes(q) || (b.author||"").toLowerCase().includes(q) || (b.genre||"").toLowerCase().includes(q);
+    return matchStatus && matchGenre && matchAuthor && matchSearch;
   });
   const counts = { all: books.length, unread: 0, reading: 0, read: 0, loaned: 0 };
   books.forEach(b => { if (counts[b.status] !== undefined) counts[b.status]++; });
+  const hasActiveFilters = genreFilter !== "all" || authorFilter !== "all" || search !== "";
+
+  const total = books.length || 1;
+  const genreCounts = {};
+  books.forEach(b => { const g = b.genre || "Unknown"; genreCounts[g] = (genreCounts[g] || 0) + 1; });
+  const genreList = Object.entries(genreCounts).sort((a, b) => b[1] - a[1]);
 
   if (!authChecked) return <div style={{ minHeight: "100vh", background: "#F7F3EC", display: "flex", alignItems: "center", justifyContent: "center" }}><Spinner size={32} color="#2C3E2D" /></div>;
   if (!session) return <AuthScreen />;
@@ -542,9 +557,59 @@ function App() {
                 {loadingBooks ? "Loading…" : books.length === 0 ? "No books yet" : `${books.length} book${books.length === 1 ? "" : "s"} catalogued`}
               </p>
             </div>
-            <button onClick={() => sb.auth.signOut()} title="Sign out"
-              style={{ background: "none", border: "1px solid #4A5E4A", borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 15, color: "#8FAB8F" }}>↪</button>
+            <div style={{ display: "flex", gap: 8 }}>
+              {books.length > 0 && (
+                <button onClick={() => setShowStats(s => !s)} title="Stats"
+                  style={{ background: showStats ? "#4A7C59" : "none", border: "1px solid #4A5E4A", borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 15, color: showStats ? "#fff" : "#8FAB8F" }}>📊</button>
+              )}
+              <button onClick={() => sb.auth.signOut()} title="Sign out"
+                style={{ background: "none", border: "1px solid #4A5E4A", borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 15, color: "#8FAB8F" }}>↪</button>
+            </div>
           </div>
+
+          {/* Stats panel */}
+          {showStats && books.length > 0 && (
+            <div style={{ marginTop: 18, background: "#243327", borderRadius: 12, padding: 16 }}>
+              {/* Status breakdown */}
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ color: "#8FAB8F", fontSize: 11, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 10 }}>Reading status</div>
+                {[
+                  ["Read", counts.read, "#4A9B6F"],
+                  ["Reading", counts.reading, "#6BA8D4"],
+                  ["Unread", counts.unread, "#C4A882"],
+                  ["Loaned out", counts.loaned, "#D47A7A"],
+                ].map(([label, count, color]) => count > 0 && (
+                  <div key={label} style={{ marginBottom: 7 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                      <span style={{ color: "#C8D8C8", fontSize: 12 }}>{label}</span>
+                      <span style={{ color: "#8FAB8F", fontSize: 12 }}>{count} · {Math.round(count / total * 100)}%</span>
+                    </div>
+                    <div style={{ height: 6, background: "#1A2B1D", borderRadius: 3, overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${count / total * 100}%`, background: color, borderRadius: 3, transition: "width 0.4s ease" }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Genre breakdown */}
+              {genreList.length > 0 && (
+                <div>
+                  <div style={{ color: "#8FAB8F", fontSize: 11, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 10 }}>By genre</div>
+                  {genreList.map(([genre, count]) => (
+                    <div key={genre} style={{ marginBottom: 7 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                        <span style={{ color: "#C8D8C8", fontSize: 12 }}>{genre}</span>
+                        <span style={{ color: "#8FAB8F", fontSize: 12 }}>{count} · {Math.round(count / total * 100)}%</span>
+                      </div>
+                      <div style={{ height: 6, background: "#1A2B1D", borderRadius: 3, overflow: "hidden" }}>
+                        <div style={{ height: "100%", width: `${count / total * 100}%`, background: "#7A9E8A", borderRadius: 3, transition: "width 0.4s ease" }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           <div style={{ display: "flex", gap: 8, marginTop: 18, flexWrap: "wrap" }}>
             <button onClick={() => setShowScanner(true)} disabled={lookingUp}
@@ -560,6 +625,7 @@ function App() {
         </div>
       </div>
 
+      {/* Status filter tabs */}
       <div style={{ background: "#EDE8DF", borderBottom: "1px solid #D8D0C4" }}>
         <div style={{ maxWidth: 640, margin: "0 auto", padding: "0 24px", display: "flex", overflowX: "auto" }}>
           {[["all","All"],["unread","Unread"],["reading","Reading"],["read","Read"],["loaned","Loaned"]].map(([key, label]) => (
@@ -571,18 +637,53 @@ function App() {
         </div>
       </div>
 
-      <div style={{ maxWidth: 640, margin: "0 auto", padding: "20px 24px 60px" }}>
+      <div style={{ maxWidth: 640, margin: "0 auto", padding: "16px 24px 60px" }}>
+
+        {/* Search + dropdowns */}
         {books.length > 0 && (
-          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by title, author, or genre…"
-            style={{ width: "100%", border: "1px solid #D8D0C4", borderRadius: 8, padding: "9px 14px", fontSize: 14, color: "#1C1810", background: "#fff", marginBottom: 16, outline: "none" }} />
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by title, author, or genre…"
+              style={{ width: "100%", border: "1px solid #D8D0C4", borderRadius: 8, padding: "9px 14px", fontSize: 14, color: "#1C1810", background: "#fff", outline: "none" }} />
+
+            <div style={{ display: "flex", gap: 8 }}>
+              {/* Genre dropdown */}
+              <div style={{ flex: 1, position: "relative" }}>
+                <select value={genreFilter} onChange={e => setGenreFilter(e.target.value)}
+                  style={{ width: "100%", appearance: "none", border: `1px solid ${genreFilter !== "all" ? "#2C3E2D" : "#D8D0C4"}`, borderRadius: 8, padding: "8px 32px 8px 12px", fontSize: 13, color: genreFilter !== "all" ? "#2C3E2D" : "#6B6358", background: genreFilter !== "all" ? "#E8F4EE" : "#fff", fontWeight: genreFilter !== "all" ? 600 : 400, cursor: "pointer", outline: "none" }}>
+                  <option value="all">All genres</option>
+                  {genres.filter(g => g !== "all").map(g => <option key={g} value={g}>{g}</option>)}
+                </select>
+                <span style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none", color: "#9B927E", fontSize: 11 }}>▾</span>
+              </div>
+
+              {/* Author dropdown */}
+              <div style={{ flex: 1, position: "relative" }}>
+                <select value={authorFilter} onChange={e => setAuthorFilter(e.target.value)}
+                  style={{ width: "100%", appearance: "none", border: `1px solid ${authorFilter !== "all" ? "#2C3E2D" : "#D8D0C4"}`, borderRadius: 8, padding: "8px 32px 8px 12px", fontSize: 13, color: authorFilter !== "all" ? "#2C3E2D" : "#6B6358", background: authorFilter !== "all" ? "#E8F4EE" : "#fff", fontWeight: authorFilter !== "all" ? 600 : 400, cursor: "pointer", outline: "none" }}>
+                  <option value="all">All authors</option>
+                  {authors.filter(a => a !== "all").map(a => <option key={a} value={a}>{a}</option>)}
+                </select>
+                <span style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none", color: "#9B927E", fontSize: 11 }}>▾</span>
+              </div>
+            </div>
+
+            {/* Clear filters */}
+            {hasActiveFilters && (
+              <button onClick={() => { setSearch(""); setGenreFilter("all"); setAuthorFilter("all"); }}
+                style={{ alignSelf: "flex-start", background: "none", border: "none", color: "#8B3A3A", fontSize: 12, cursor: "pointer", textDecoration: "underline", padding: 0 }}>
+                Clear filters
+              </button>
+            )}
+          </div>
         )}
+
         {loadingBooks ? (
           <div style={{ textAlign: "center", padding: "60px 0" }}><Spinner size={28} color="#9B927E" /></div>
         ) : filtered.length === 0 ? (
           <div style={{ textAlign: "center", padding: "60px 0", color: "#9B927E" }}>
             {books.length === 0
               ? <><div style={{ fontSize: 48, marginBottom: 12 }}>📚</div><div style={{ fontSize: 16, fontWeight: 600, color: "#6B6358", marginBottom: 6 }}>Your shelves are empty</div><div style={{ fontSize: 14 }}>Scan a barcode or add a book manually to get started.</div></>
-              : <><div style={{ fontSize: 32, marginBottom: 8 }}>🔍</div><div style={{ fontSize: 14 }}>No books match your search.</div></>}
+              : <><div style={{ fontSize: 32, marginBottom: 8 }}>🔍</div><div style={{ fontSize: 14 }}>No books match your filters.</div></>}
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>

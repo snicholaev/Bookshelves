@@ -49,6 +49,58 @@ function fromDb(row) {
 
 const EMPTY_BOOK = { id: null, title: "", author: "", year: "", genre: "", status: "unread", loanedTo: "", notes: "", cover: null };
 
+// ── Genre list ────────────────────────────────────────────────────────────────
+const GENRES = [
+  "Literary Fiction", "Historical Fiction", "Science Fiction", "Fantasy",
+  "Mystery & Thriller", "Horror", "Romance", "Adventure", "Short Stories", "Graphic Novel",
+  "Biography & Memoir", "History", "Science & Nature", "Psychology", "Philosophy",
+  "Politics & Society", "Business & Economics", "Self-Help", "Travel", "True Crime",
+  "Essays", "Food & Cooking", "Art & Photography", "Religion & Spirituality",
+  "Children's", "Young Adult", "Poetry", "Classic Literature", "Reference", "Other",
+];
+
+// Map Open Library subjects → our genre list
+const GENRE_RULES = [
+  [["biography","memoir","autobiography","life of"], "Biography & Memoir"],
+  [["science fiction","sci-fi","space opera","dystopia","cyberpunk","futuristic"], "Science Fiction"],
+  [["fantasy","magic","wizards","dragons","epic fantasy"], "Fantasy"],
+  [["mystery","detective","crime fiction","noir","whodunit"], "Mystery & Thriller"],
+  [["thriller","suspense","espionage","spy"], "Mystery & Thriller"],
+  [["horror","ghost","supernatural","occult"], "Horror"],
+  [["romance","love story","romantic"], "Romance"],
+  [["historical fiction","alternate history"], "Historical Fiction"],
+  [["history","world war","ancient","medieval","civilization"], "History"],
+  [["psychology","psychiatry","mental health","behavior","cognitive"], "Psychology"],
+  [["philosophy","ethics","logic","metaphysics"], "Philosophy"],
+  [["politics","political","government","democracy","socialism"], "Politics & Society"],
+  [["economics","finance","business","entrepreneurship","management"], "Business & Economics"],
+  [["self-help","personal development","motivation","productivity"], "Self-Help"],
+  [["travel","adventure","exploration","journey"], "Travel"],
+  [["true crime","serial killer","murder"], "True Crime"],
+  [["science","nature","physics","biology","chemistry","astronomy","mathematics"], "Science & Nature"],
+  [["cooking","food","recipes","cuisine","baking"], "Food & Cooking"],
+  [["art","photography","design","architecture","painting"], "Art & Photography"],
+  [["religion","spirituality","theology","bible","quran","buddhism"], "Religion & Spirituality"],
+  [["children","juvenile","kids","picture book"], "Children's"],
+  [["young adult","teen","coming of age"], "Young Adult"],
+  [["poetry","poems","verse"], "Poetry"],
+  [["classic","victorian","19th century","shakespeare","dickens"], "Classic Literature"],
+  [["graphic novel","comic","manga"], "Graphic Novel"],
+  [["essays","literary criticism"], "Essays"],
+  [["short stories","short fiction"], "Short Stories"],
+  [["adventure","action"], "Adventure"],
+  [["reference","encyclopedia","dictionary","handbook"], "Reference"],
+];
+
+function guessGenre(subjects = []) {
+  const text = subjects.map(s => (s.name || s || "").toLowerCase()).join(" ");
+  if (!text) return "";
+  for (const [keywords, genre] of GENRE_RULES) {
+    if (keywords.some(k => text.includes(k))) return genre;
+  }
+  return "";
+}
+
 // ── Image compression ──────────────────────────────────────────────────────────
 function compressImage(dataUrl) {
   return new Promise((resolve) => {
@@ -79,7 +131,7 @@ async function lookupISBN(isbn) {
       title: book.title || "",
       author: book.authors?.[0]?.name || "",
       year: book.publish_date ? book.publish_date.match(/\d{4}/)?.[0] || "" : "",
-      genre: book.subjects?.[0]?.name || "",
+      genre: guessGenre(book.subjects || []),
       cover: book.cover?.medium || null,
     };
   } catch { return null; }
@@ -401,12 +453,37 @@ function EditModal({ book, onSave, onClose }) {
           <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", color: "#9B927E" }}>×</button>
         </div>
         <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 14 }}>
-          {[["Title","title","Book title"],["Author","author","Author name"],["Year","year","e.g. 2018"],["Genre","genre","e.g. Fiction, History…"]].map(([label, key, placeholder]) => (
+          {[["Title","title","Book title"],["Author","author","Author name"],["Year","year","e.g. 2018"]].map(([label, key, placeholder]) => (
             <div key={key}>
               <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>{label}</label>
               <input style={inputStyle} value={form[key] || ""} onChange={e => set(key, e.target.value)} placeholder={placeholder} />
             </div>
           ))}
+
+          {/* Genre dropdown */}
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+              Genre {form.genre && GENRES.includes(form.genre) === false && form.genre !== "__custom__" && <span style={{ color: "#2C6E49", fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>· auto-guessed</span>}
+            </label>
+            <div style={{ position: "relative" }}>
+              <select
+                value={GENRES.includes(form.genre) ? form.genre : form.genre ? "__custom__" : ""}
+                onChange={e => {
+                  if (e.target.value === "__custom__") set("genre", form.genre || "");
+                  else set("genre", e.target.value);
+                }}
+                style={{ ...inputStyle, appearance: "none", paddingRight: 32, cursor: "pointer" }}>
+                <option value="">Select a genre…</option>
+                {GENRES.map(g => <option key={g} value={g}>{g}</option>)}
+                <option value="__custom__">✏️ Custom genre…</option>
+              </select>
+              <span style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none", color: "#9B927E", fontSize: 11 }}>▾</span>
+            </div>
+            {/* Show text input for custom genre */}
+            {form.genre && !GENRES.includes(form.genre) && (
+              <input style={{ ...inputStyle, marginTop: 8 }} value={form.genre} onChange={e => set("genre", e.target.value)} placeholder="Enter custom genre…" />
+            )}
+          </div>
           <div>
             <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>Status</label>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>

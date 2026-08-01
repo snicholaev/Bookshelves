@@ -463,13 +463,13 @@ function EditModal({ book, onSave, onClose }) {
           {/* Genre dropdown */}
           <div>
             <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6358", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>
-              Genre {form.genre && GENRES.includes(form.genre) === false && form.genre !== "__custom__" && <span style={{ color: "#2C6E49", fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>· auto-guessed</span>}
+              Genre {form.genre && !GENRES.includes(form.genre) && <span style={{ color: "#2C6E49", fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>· custom</span>}
             </label>
             <div style={{ position: "relative" }}>
               <select
                 value={GENRES.includes(form.genre) ? form.genre : form.genre ? "__custom__" : ""}
                 onChange={e => {
-                  if (e.target.value === "__custom__") set("genre", form.genre || "");
+                  if (e.target.value === "__custom__") set("genre", "");
                   else set("genre", e.target.value);
                 }}
                 style={{ ...inputStyle, appearance: "none", paddingRight: 32, cursor: "pointer" }}>
@@ -479,9 +479,15 @@ function EditModal({ book, onSave, onClose }) {
               </select>
               <span style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none", color: "#9B927E", fontSize: 11 }}>▾</span>
             </div>
-            {/* Show text input for custom genre */}
-            {form.genre && !GENRES.includes(form.genre) && (
-              <input style={{ ...inputStyle, marginTop: 8 }} value={form.genre} onChange={e => set("genre", e.target.value)} placeholder="Enter custom genre…" />
+            {/* Show text input when custom genre is selected */}
+            {(!GENRES.includes(form.genre) && (form.genre !== "" || GENRES.includes(form.genre) === false)) && (
+              <input
+                style={{ ...inputStyle, marginTop: 8 }}
+                value={form.genre}
+                onChange={e => set("genre", e.target.value)}
+                placeholder="Enter custom genre e.g. Southern Gothic…"
+                autoFocus={!GENRES.includes(form.genre)}
+              />
             )}
           </div>
           <div>
